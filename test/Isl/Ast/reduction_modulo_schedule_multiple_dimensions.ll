@@ -13,6 +13,12 @@
 ; CHECK:          for (int c3 = 0; c3 <= 1023; c3 += 1)
 ; CHECK:            Stmt_for_body3(c1, c3);
 ; CHECK:    }
+; CHECK:    #pragma known-parallel
+; CHECK:    for (int c0 = 0; c0 <= 1; c0 += 1)
+; CHECK:      for (int c1 = c0; c1 < 2 * n; c1 += 2)
+; CHECK:        #pragma simd reduction
+; CHECK:        for (int c3 = 0; c3 <= 1023; c3 += 1)
+; CHECK:          Stmt_for_body3(c1, c3);
 ;
 ;    void rmsmd(int *A, long n) {
 ;      for (long i = 0; i < 2 * n; i++)

@@ -69,6 +69,7 @@ set (ISL_FILES
     External/isl/isl_local_space.c
     External/isl/isl_lp.c
     External/isl/isl_map.c
+    External/isl/isl_map_list.c
     External/isl/isl_map_simplify.c
     External/isl/isl_map_subtract.c
     External/isl/isl_map_to_basic_set.c
@@ -85,6 +86,10 @@ set (ISL_FILES
     External/isl/isl_sample.c
     External/isl/isl_scan.c
     External/isl/isl_schedule.c
+    External/isl/isl_schedule_band.c
+    External/isl/isl_schedule_node.c
+    External/isl/isl_schedule_read.c
+    External/isl/isl_schedule_tree.c
     External/isl/isl_scheduler.c
     External/isl/isl_seq.c
     External/isl/isl_set_list.c
