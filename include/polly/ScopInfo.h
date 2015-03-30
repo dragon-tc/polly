@@ -105,7 +105,7 @@ private:
 
   const Value *BaseAddr;
   std::string BaseName;
-  isl_basic_map *createBasicAccessMap(ScopStmt *Statement);
+  __isl_give isl_basic_map *createBasicAccessMap(ScopStmt *Statement);
   void setBaseName();
   ScopStmt *Statement;
 
@@ -138,7 +138,7 @@ private:
   const Instruction *Inst;
 
   /// Updated access relation read from JSCOP file.
-  isl_map *newAccessRelation;
+  __isl_give  isl_map *newAccessRelation;
 
   void assumeNoOutOfBound(const IRAccess &Access);
 
@@ -197,7 +197,7 @@ public:
   /// Get the stride of this memory access in the specified Schedule. Schedule
   /// is a map from the statement to a schedule where the innermost dimension is
   /// the dimension of the innermost loop containing the statement.
-  isl_set *getStride(__isl_take const isl_map *Schedule) const;
+  __isl_give isl_set *getStride(__isl_take const isl_map *Schedule) const;
 
   /// Is the stride of the access equal to a certain width? Schedule is a map
   /// from the statement to a schedule where the innermost dimension is the
@@ -383,7 +383,7 @@ public:
   /// @brief Get the id of the iteration domain space
   ///
   /// @return The id of the iteration domain space
-  isl_id *getDomainId() const;
+  __isl_give isl_id *getDomainId() const;
 
   /// @brief Get an isl string representing this domain.
   std::string getDomainStr() const;
@@ -392,7 +392,7 @@ public:
   ///
   /// @return The scattering function of this ScopStmt.
   __isl_give isl_map *getScattering() const;
-  void setScattering(isl_map *scattering);
+  void setScattering(__isl_take isl_map *scattering);
 
   /// @brief Get an isl string representing this scattering.
   std::string getScatteringStr() const;

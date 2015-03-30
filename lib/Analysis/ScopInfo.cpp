@@ -334,7 +334,7 @@ void MemoryAccess::setBaseName() {
   BaseName = "MemRef_" + BaseName;
 }
 
-isl_map *MemoryAccess::getAccessRelation() const {
+__isl_give isl_map *MemoryAccess::getOriginalAccessRelation() const {
   return isl_map_copy(AccessRelation);
 }
 
@@ -346,11 +346,12 @@ __isl_give isl_space *MemoryAccess::getAccessRelationSpace() const {
   return isl_map_get_space(AccessRelation);
 }
 
-isl_map *MemoryAccess::getNewAccessRelation() const {
+__isl_give isl_map *MemoryAccess::getNewAccessRelation() const {
   return isl_map_copy(newAccessRelation);
 }
 
-isl_basic_map *MemoryAccess::createBasicAccessMap(ScopStmt *Statement) {
+__isl_give isl_basic_map *
+MemoryAccess::createBasicAccessMap(ScopStmt *Statement) {
   isl_space *Space = isl_space_set_alloc(Statement->getIslCtx(), 0, 1);
   Space = isl_space_set_tuple_name(Space, isl_dim_set, getBaseName().c_str());
   Space = isl_space_align_params(Space, Statement->getDomainSpace());
@@ -580,7 +581,8 @@ static isl_map *getEqualAndLarger(isl_space *setDomain) {
   return Map;
 }
 
-isl_set *MemoryAccess::getStride(__isl_take const isl_map *Schedule) const {
+__isl_give isl_set *
+MemoryAccess::getStride(__isl_take const isl_map *Schedule) const {
   isl_map *S = const_cast<isl_map *>(Schedule);
   isl_map *AccessRelation = getAccessRelation();
   isl_space *Space = isl_space_range(isl_map_get_space(S));
@@ -643,7 +645,7 @@ void ScopStmt::restrictDomain(__isl_take isl_set *NewDomain) {
   Scattering = isl_map_intersect_domain(Scattering, isl_set_copy(Domain));
 }
 
-void ScopStmt::setScattering(isl_map *NewScattering) {
+void ScopStmt::setScattering(__isl_take isl_map *NewScattering) {
   assert(NewScattering && "New scattering is nullptr");
   isl_map_free(Scattering);
   Scattering = NewScattering;
@@ -985,13 +987,15 @@ const Loop *ScopStmt::getLoopForDimension(unsigned Dimension) const {
 
 isl_ctx *ScopStmt::getIslCtx() const { return Parent.getIslCtx(); }
 
-isl_set *ScopStmt::getDomain() const { return isl_set_copy(Domain); }
+__isl_give isl_set *ScopStmt::getDomain() const { return isl_set_copy(Domain); }
 
-isl_space *ScopStmt::getDomainSpace() const {
+_isl_give isl_space *ScopStmt::getDomainSpace() const {
   return isl_set_get_space(Domain);
 }
 
-isl_id *ScopStmt::getDomainId() const { return isl_set_get_tuple_id(Domain); }
+__isl_give isl_id *ScopStmt::getDomainId() const {
+  return isl_set_get_tuple_id(Domain);
+}
 
 ScopStmt::~ScopStmt() {
   while (!MemAccs.empty()) {
