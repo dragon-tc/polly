@@ -51,7 +51,7 @@ exit.3:
   ret void
 }
 
-; VALUE: region: 'S1 => exit.3' in function 'sequential_writes':
+; VALUE-LABEL: region: 'S1 => exit.3' in function 'sequential_writes':
 ; VALUE:   RAW dependences:
 ; VALUE:     {  }
 ; VALUE:   WAR dependences:
@@ -63,7 +63,7 @@ exit.3:
 ; VALUE:       Stmt_S1[i0] -> Stmt_S3[i0] : i0 >= 10 and i0 <= 99
 ; VALUE:     }
 
-; MEMORY: region: 'S1 => exit.3' in function 'sequential_writes':
+; MEMORY-LABEL: region: 'S1 => exit.3' in function 'sequential_writes':
 ; MEMORY:   RAW dependences:
 ; MEMORY:     {  }
 ; MEMORY:   WAR dependences:
@@ -126,7 +126,7 @@ exit.3:
   ret void
 }
 
-; VALUE: region: 'S1 => exit.3' in function 'read_after_writes':
+; VALUE-LABEL: region: 'S1 => exit.3' in function 'read_after_writes':
 ; VALUE:   RAW dependences:
 ; VALUE:     {
 ; VALUE:       Stmt_S2[i0] -> Stmt_S3[i0] : i0 >= 0 and i0 <= 9;
@@ -136,10 +136,10 @@ exit.3:
 ; VALUE:     {  }
 ; VALUE:   WAW dependences:
 ; VALUE:     {
-; VALUE:       Stmt_S1[i0] -> Stmt_S2[i0] : i0 >= 0 and i0 <= 9
+; VALUE:       Stmt_S1[i0] -> Stmt_S2[i0] : i0 <= 9 and i0 >= 0
 ; VALUE:     }
 
-; MEMORY: region: 'S1 => exit.3' in function 'read_after_writes':
+; MEMORY-LABEL: region: 'S1 => exit.3' in function 'read_after_writes':
 ; MEMORY:   RAW dependences:
 ; MEMORY:     {
 ; MEMORY:       Stmt_S2[i0] -> Stmt_S3[i0] : i0 <= 9 and i0 >= 0;
@@ -203,7 +203,7 @@ exit.3:
   ret void
 }
 
-; VALUE: region: 'S1 => exit.3' in function 'write_after_read':
+; VALUE-LABEL: region: 'S1 => exit.3' in function 'write_after_read':
 ; VALUE:   RAW dependences:
 ; VALUE:     {
 ; VALUE:     }
@@ -214,10 +214,10 @@ exit.3:
 ; VALUE:     }
 ; VALUE:   WAW dependences:
 ; VALUE:     {
-; VALUE:       Stmt_S2[i0] -> Stmt_S3[i0] : i0 >= 0 and i0 <= 9
+; VALUE:       Stmt_S2[i0] -> Stmt_S3[i0] : i0 <= 9 and i0 >= 0
 ; VALUE:     }
 
-; MEMORY: region: 'S1 => exit.3' in function 'write_after_read':
+; MEMORY-LABEL: region: 'S1 => exit.3' in function 'write_after_read':
 ; MEMORY:   RAW dependences:
 ; MEMORY:     {
 ; MEMORY:     }
