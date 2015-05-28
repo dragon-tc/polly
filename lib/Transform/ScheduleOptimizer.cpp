@@ -444,10 +444,14 @@ IslScheduleOptimizer::getScheduleForBandList(isl_band_list *BandList) {
   return Schedule;
 }
 
-isl_union_map *IslScheduleOptimizer::getScheduleMap(isl_schedule *Schedule) {
-  isl_band_list *BandList = isl_schedule_get_band_forest(Schedule);
-  isl_union_map *ScheduleMap = getScheduleForBandList(BandList);
-  isl_band_list_free(BandList);
+__isl_give isl_union_map *
+IslScheduleOptimizer::getScheduleMap(__isl_keep isl_schedule *Schedule) {
+  isl_schedule_node *Root = isl_schedule_get_root(Schedule);
+  Root = isl_schedule_node_map_descendant_bottom_up(
+      Root, IslScheduleOptimizer::optimizeBand, NULL);
+  auto ScheduleMap = isl_schedule_node_get_subtree_schedule_union_map(Root);
+  ScheduleMap = isl_union_map_detect_equalities(ScheduleMap);
+  isl_schedule_node_free(Root);
   return ScheduleMap;
 }
 
