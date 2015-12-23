@@ -40,6 +40,7 @@
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 
 #include "isl/union_map.h"
+#include "isl/union_set.h"
 #include "isl/list.h"
 #include "isl/ast.h"
 #include "isl/ast_build.h"
