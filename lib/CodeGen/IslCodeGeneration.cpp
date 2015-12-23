@@ -334,31 +334,9 @@ static int findValuesInStmt(isl_set *Set, void *UserPtr) {
         User.Values.insert(SrcVal);
     }
   }
-  return 0;
-}
-
-/// Extract the values and SCEVs needed to generate code for a ScopStmt.
-///
-/// This function extracts a ScopStmt from a given isl_set and computes the
-/// Values this statement depends on as well as a set of SCEV expressions that
-/// need to be synthesized when generating code for this statment.
-static isl_stat findValuesInStmt(isl_set *Set, void *UserPtr) {
-  isl_id *Id = isl_set_get_tuple_id(Set);
-  struct FindValuesUser &User = *static_cast<struct FindValuesUser *>(UserPtr);
-  const ScopStmt *Stmt = static_cast<const ScopStmt *>(isl_id_get_user(Id));
-
-  if (Stmt->isBlockStmt())
-    findValuesInBlock(User, Stmt, Stmt->getBasicBlock());
-  else {
-    assert(Stmt->isRegionStmt() &&
-           "Stmt was neither block nor region statement");
-    for (const BasicBlock *BB : Stmt->getRegion()->blocks())
-      findValuesInBlock(User, Stmt, BB);
-  }
-
   isl_id_free(Id);
   isl_set_free(Set);
-  return isl_stat_ok;
+  return 0;
 }
 
 void IslNodeBuilder::getReferencesInSubtree(__isl_keep isl_ast_node *For,
