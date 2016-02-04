@@ -238,10 +238,15 @@ public:
   ///  on the first creation. This function allows to update the sizes of the
   ///  ScopArrayInfo object by adding additional outer array dimensions.
   ///
-  ///  @param A vector of array sizes where the rightmost array sizes need to
-  ///         match the innermost array sizes already defined in SAI.
-  ///  @returns Returns true if the update was successful, otherwise false.
-  bool updateSizes(ArrayRef<const SCEV *> Sizes);
+  ///  Similarly, memory accesses referencing this ScopArrayInfo object may use
+  ///  different element sizes. This function ensures the canonical element type
+  ///  stored is small enough to model all memory accesses.
+  ///
+  ///  @param Sizes       A vector of array sizes where the rightmost array
+  ///                     sizes need to match the innermost array sizes already
+  ///                     defined in SAI.
+  ///  @param ElementType The element type of this memory access.
+  bool updateSizes(ArrayRef<const SCEV *> Sizes, Type *ElementType);
 
   /// @brief Destructor to free the isl id of the base pointer.
   ~ScopArrayInfo();
@@ -341,7 +346,13 @@ private:
   /// @brief The base pointer.
   AssertingVH<Value> BasePtr;
 
-  /// @brief The type of the elements stored in this array.
+  /// @brief The canonical element type of this array.
+  ///
+  /// The canonical element type describes the minimal accessible element in
+  /// this array. Not all elements accessed, need to be of the very same type,
+  /// but the allocation size of the type of the elements loaded/stored from/to
+  /// this array needs to be a multiple of the allocation size of the canonical
+  /// type.
   Type *ElementType;
 
   /// @brief The isl id for the base pointer.
@@ -514,7 +525,32 @@ private:
   /// @brief Subscript expression for each dimension.
   SmallVector<const SCEV *, 4> Subscripts;
 
-  /// @brief Relation from statment instances to the accessed array elements.
+  /// @brief Relation from statement instances to the accessed array elements.
+  ///
+  /// In the common case this relation is a function that maps a set of loop
+  /// indices to the memory address from which a value is loaded/stored:
+  ///
+  ///      for i
+  ///        for j
+  ///    S:     A[i + 3 j] = ...
+  ///
+  ///    => { S[i,j] -> A[i + 3j] }
+  ///
+  /// In case the exact access function is not known, the access relation may
+  /// also be a one to all mapping { S[i,j] -> A[o] } describing that any
+  /// element accessible through A might be accessed.
+  ///
+  /// In case of an access to a larger element belonging to an array that also
+  /// contains smaller elements, the access relation models the larger access
+  /// with multiple smaller accesses of the size of the minimal array element
+  /// type:
+  ///
+  ///      short *A;
+  ///
+  ///      for i
+  ///    S:     A[i] = *((double*)&A[4 * i]);
+  ///
+  ///    => { S[i] -> A[i]; S[i] -> A[o] : 4i <= o <= 4i + 3 }
   isl_map *AccessRelation;
 
   /// @brief Updated access relation read from JSCOP file.
@@ -637,6 +673,21 @@ public:
     return hasNewAccessRelation() ? getNewAccessRelation()
                                   : getOriginalAccessRelation();
   }
+
+  /// @brief Get an isl map describing the memory address accessed.
+  ///
+  /// In most cases the memory address accessed is well described by the access
+  /// relation obtained with getAccessRelation. However, in case of arrays
+  /// accessed with types of different size the access relation maps one access
+  /// to multiple smaller address locations. This method returns an isl map that
+  /// relates each dynamic statement instance to the unique memory location
+  /// that is loaded from / stored to.
+  ///
+  /// For an access relation { S[i] -> A[o] : 4i <= o <= 4i + 3 } this method
+  /// will return the address function { S[i] -> A[4i] }.
+  ///
+  /// @returns The address function for this memory access.
+  __isl_give isl_map *getAddressFunction() const;
 
   /// @brief Return the access relation after the schedule was applied.
   __isl_give isl_pw_multi_aff *
