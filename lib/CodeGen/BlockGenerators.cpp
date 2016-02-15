@@ -187,8 +187,12 @@ Value *BlockGenerator::generateLocationAccessed(
     OldPtrTy = PointerType::get(OldPtrTy->getElementType(),
                                 NewPtrTy->getPointerAddressSpace());
 
-    if (OldPtrTy != NewPtrTy)
+    if (OldPtrTy != NewPtrTy) {
+      assert(OldPtrTy->getPointerElementType()->getPrimitiveSizeInBits() ==
+                 NewPtrTy->getPointerElementType()->getPrimitiveSizeInBits() &&
+             "Pointer types to elements with different size found");
       Address = Builder.CreateBitOrPointerCast(Address, OldPtrTy);
+    }
     return Address;
   }
 

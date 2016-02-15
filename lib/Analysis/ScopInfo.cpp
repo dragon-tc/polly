@@ -182,7 +182,7 @@ ScopArrayInfo::ScopArrayInfo(Value *BasePtr, Type *ElementType, isl_ctx *Ctx,
       getIslCompatibleName("MemRef_", BasePtr, Kind == MK_PHI ? "__phi" : "");
   Id = isl_id_alloc(Ctx, BasePtrName.c_str(), this);
 
-  updateSizes(Sizes, ElementType);
+  updateSizes(Sizes);
   BasePtrOriginSAI = identifyBasePtrOriginSAI(S, BasePtr);
   if (BasePtrOriginSAI)
     const_cast<ScopArrayInfo *>(BasePtrOriginSAI)->addDerivedSAI(this);
@@ -195,21 +195,7 @@ __isl_give isl_space *ScopArrayInfo::getSpace() const {
   return Space;
 }
 
-bool ScopArrayInfo::updateSizes(ArrayRef<const SCEV *> NewSizes,
-                                Type *NewElementType) {
-  auto OldElementSize = DL.getTypeAllocSizeInBits(ElementType);
-  auto NewElementSize = DL.getTypeAllocSizeInBits(NewElementType);
-
-  if (NewElementSize != OldElementSize) {
-    if (NewElementSize % OldElementSize == 0 &&
-        NewElementSize < OldElementSize) {
-      ElementType = NewElementType;
-    } else {
-      auto GCD = GreatestCommonDivisor64(NewElementSize, OldElementSize);
-      ElementType = IntegerType::get(ElementType->getContext(), GCD);
-    }
-  }
-
+bool ScopArrayInfo::updateSizes(ArrayRef<const SCEV *> NewSizes) {
   int SharedDims = std::min(NewSizes.size(), DimensionSizes.size());
   int ExtraDimsNew = NewSizes.size() - SharedDims;
   int ExtraDimsOld = DimensionSizes.size() - SharedDims;
@@ -297,9 +283,8 @@ void MemoryAccess::updateDimensionality() {
   auto DimsAccess = isl_space_dim(AccessSpace, isl_dim_set);
   auto DimsMissing = DimsArray - DimsAccess;
 
-  auto Map = isl_map_from_domain_and_range(
-      isl_set_universe(AccessSpace),
-      isl_set_universe(isl_space_copy(ArraySpace)));
+  auto Map = isl_map_from_domain_and_range(isl_set_universe(AccessSpace),
+                                           isl_set_universe(ArraySpace));
 
   for (unsigned i = 0; i < DimsMissing; i++)
     Map = isl_map_fix_si(Map, isl_dim_out, i, 0);
@@ -308,47 +293,6 @@ void MemoryAccess::updateDimensionality() {
     Map = isl_map_equate(Map, isl_dim_in, i - DimsMissing, isl_dim_out, i);
 
   AccessRelation = isl_map_apply_range(AccessRelation, Map);
-
-  // Introduce multi-element accesses in case the type loaded by this memory
-  // access is larger than the canonical element type of the array.
-  //
-  // An access ((float *)A)[i] to an array char *A is modeled as
-  // {[i] -> A[o] : 4 i <= o <= 4 i + 3
-  unsigned ArrayElemSize = getScopArrayInfo()->getElemSizeInBytes();
-  if (ElemBytes > ArrayElemSize) {
-    assert(ElemBytes % ArrayElemSize == 0 &&
-           "Loaded element size should be multiple of canonical element size");
-    auto Map = isl_map_from_domain_and_range(
-        isl_set_universe(isl_space_copy(ArraySpace)),
-        isl_set_universe(isl_space_copy(ArraySpace)));
-    for (unsigned i = 0; i < DimsArray - 1; i++)
-      Map = isl_map_equate(Map, isl_dim_in, i, isl_dim_out, i);
-
-    isl_ctx *Ctx;
-    isl_constraint *C;
-    isl_local_space *LS;
-
-    LS = isl_local_space_from_space(isl_map_get_space(Map));
-    Ctx = isl_map_get_ctx(Map);
-    int Num = ElemBytes / getScopArrayInfo()->getElemSizeInBytes();
-
-    C = isl_constraint_alloc_inequality(isl_local_space_copy(LS));
-    C = isl_constraint_set_constant_val(C, isl_val_int_from_si(Ctx, Num - 1));
-    C = isl_constraint_set_coefficient_si(C, isl_dim_in,
-                                          DimsArray - 1 - DimsMissing, Num);
-    C = isl_constraint_set_coefficient_si(C, isl_dim_out, DimsArray - 1, -1);
-    Map = isl_map_add_constraint(Map, C);
-
-    C = isl_constraint_alloc_inequality(LS);
-    C = isl_constraint_set_coefficient_si(C, isl_dim_in,
-                                          DimsArray - 1 - DimsMissing, -Num);
-    C = isl_constraint_set_coefficient_si(C, isl_dim_out, DimsArray - 1, 1);
-    C = isl_constraint_set_constant_val(C, isl_val_int_from_si(Ctx, 0));
-    Map = isl_map_add_constraint(Map, C);
-    AccessRelation = isl_map_apply_range(AccessRelation, Map);
-  }
-
-  isl_space_free(ArraySpace);
 
   assumeNoOutOfBound();
 }
@@ -484,10 +428,6 @@ __isl_give isl_id *MemoryAccess::getArrayId() const {
   return isl_map_get_tuple_id(AccessRelation, isl_dim_out);
 }
 
-__isl_give isl_map *MemoryAccess::getAddressFunction() const {
-  return isl_map_lexmin(getAccessRelation());
-}
-
 __isl_give isl_pw_multi_aff *MemoryAccess::applyScheduleToAccessRelation(
     __isl_take isl_union_map *USchedule) const {
   isl_map *Schedule, *ScheduledAccRel;
@@ -496,7 +436,7 @@ __isl_give isl_pw_multi_aff *MemoryAccess::applyScheduleToAccessRelation(
   UDomain = isl_union_set_from_set(getStatement()->getDomain());
   USchedule = isl_union_map_intersect_domain(USchedule, UDomain);
   Schedule = isl_map_from_union_map(USchedule);
-  ScheduledAccRel = isl_map_apply_domain(getAddressFunction(), Schedule);
+  ScheduledAccRel = isl_map_apply_domain(getAccessRelation(), Schedule);
   return isl_pw_multi_aff_from_map(ScheduledAccRel);
 }
 
@@ -2710,11 +2650,10 @@ Scop::Scop(Region &R, AccFuncMapType &AccFuncMap, ScopDetection &SD,
       HasSingleExitEdge(R.getExitingBlock()), HasErrorBlock(false),
       MaxLoopDepth(MaxLoopDepth), IslCtx(Context), Context(nullptr),
       Affinator(this), AssumedContext(nullptr), BoundaryContext(nullptr),
-      Schedule(nullptr) {
-  buildContext();
-}
+      Schedule(nullptr) {}
 
 void Scop::init(AliasAnalysis &AA, AssumptionCache &AC) {
+  buildContext();
   addUserAssumptions(AC);
   buildInvariantEquivalenceClasses();
 
@@ -3026,7 +2965,7 @@ Scop::getOrCreateScopArrayInfo(Value *BasePtr, Type *AccessType,
   } else {
     // In case of mismatching array sizes, we bail out by setting the run-time
     // context to false.
-    if (!SAI->updateSizes(Sizes, ElementType))
+    if (!SAI->updateSizes(Sizes))
       invalidate(DELINEARIZATION, DebugLoc());
   }
   return SAI.get();
@@ -3875,24 +3814,10 @@ void ScopInfo::buildMemoryAccess(
 
   auto AccItr = InsnToMemAcc.find(Inst);
   if (PollyDelinearize && AccItr != InsnToMemAcc.end()) {
-    std::vector<const SCEV *> Sizes(
-        AccItr->second.Shape->DelinearizedSizes.begin(),
-        AccItr->second.Shape->DelinearizedSizes.end());
-    // Remove the element size. This information is already provided by the
-    // ElementSize parameter. In case the element size of this access and the
-    // element size used for delinearization differs the delinearization is
-    // incorrect. Hence, we invalidate the scop.
-    //
-    // TODO: Handle delinearization with differing element sizes.
-    auto DelinearizedSize =
-        cast<SCEVConstant>(Sizes.back())->getAPInt().getSExtValue();
-    Sizes.pop_back();
-    if (ElementSize != DelinearizedSize)
-      scop->invalidate(DELINEARIZATION, Inst.getDebugLoc());
-
-    addArrayAccess(Inst, Type, BasePointer->getValue(), ElementSize, true,
-                   AccItr->second.DelinearizedSubscripts, Sizes, Val);
-    return true;
+    addArrayAccess(Inst, Type, BasePointer->getValue(), Size, true,
+                   AccItr->second.DelinearizedSubscripts,
+                   AccItr->second.Shape->DelinearizedSizes, Val);
+    return;
   }
 
   // Check if the access depends on a loop contained in a non-affine subregion.
