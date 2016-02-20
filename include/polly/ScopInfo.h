@@ -74,7 +74,6 @@ enum AssumptionKind {
   ALIASING,
   INBOUNDS,
   WRAPPING,
-  ALIGNMENT,
   ERRORBLOCK,
   INFINITELOOP,
   INVARIANTLOAD,
@@ -234,6 +233,16 @@ public:
                 ArrayRef<const SCEV *> DimensionSizes, enum MemoryKind Kind,
                 const DataLayout &DL, Scop *S);
 
+  ///  @brief Update the element type of the ScopArrayInfo object.
+  ///
+  ///  Memory accesses referencing this ScopArrayInfo object may use
+  ///  different element sizes. This function ensures the canonical element type
+  ///  stored is small enough to model accesses to the current element type as
+  ///  well as to @p NewElementType.
+  ///
+  ///  @param NewElementType An element type that is used to access this array.
+  void updateElementType(Type *NewElementType);
+
   ///  @brief Update the sizes of the ScopArrayInfo object.
   ///
   ///  A ScopArrayInfo object may be created without all outer dimensions being
@@ -241,15 +250,10 @@ public:
   ///  this ScopArrayInfo object. It verifies that sizes are compatible and adds
   ///  additional outer array dimensions, if needed.
   ///
-  ///  Similarly, memory accesses referencing this ScopArrayInfo object may use
-  ///  different element sizes. This function ensures the canonical element type
-  ///  stored is small enough to model all memory accesses.
-  ///
   ///  @param Sizes       A vector of array sizes where the rightmost array
   ///                     sizes need to match the innermost array sizes already
   ///                     defined in SAI.
-  ///  @param ElementType The element type of this memory access.
-  bool updateSizes(ArrayRef<const SCEV *> Sizes, Type *ElementType);
+  bool updateSizes(ArrayRef<const SCEV *> Sizes);
 
   /// @brief Destructor to free the isl id of the base pointer.
   ~ScopArrayInfo();
@@ -703,7 +707,7 @@ public:
   /// As 2) is by construction "newer" than 1) we return the new access
   /// relation if present.
   ///
-  isl_map *getAccessRelation() const {
+  __isl_give isl_map *getAccessRelation() const {
     return hasNewAccessRelation() ? getNewAccessRelation()
                                   : getOriginalAccessRelation();
   }
@@ -755,6 +759,9 @@ public:
 
   /// @brief Return the access instruction of this memory access.
   Instruction *getAccessInstruction() const { return AccessInstruction; }
+
+  /// @brief Return the access function subscript in the dimension @p Dim.
+  const SCEV *getSubscript(unsigned Dim) const { return Subscripts[Dim]; }
 
   /// Get the stride of this memory access in the specified Schedule. Schedule
   /// is a map from the statement to a schedule where the innermost dimension is
@@ -1148,6 +1155,7 @@ public:
   iterator end() { return MemAccs.end(); }
   const_iterator begin() const { return MemAccs.begin(); }
   const_iterator end() const { return MemAccs.end(); }
+  size_t size() const { return MemAccs.size(); }
 
   unsigned getNumParams() const;
   unsigned getNumIterators() const;
@@ -1268,7 +1276,13 @@ private:
   ParamIdType ParameterIds;
 
   /// Isl context.
-  isl_ctx *IslCtx;
+  ///
+  /// We need a shared_ptr with reference counter to delete the context when all
+  /// isl objects are deleted. We will distribute the shared_ptr to all objects
+  /// that use the context to create isl objects, and increase the reference
+  /// counter. By doing this, we guarantee that the context is deleted when we
+  /// delete the last object that creates isl objects with the context.
+  std::shared_ptr<isl_ctx> IslCtx;
 
   /// @brief A map from basic blocks to SCoP statements.
   DenseMap<BasicBlock *, ScopStmt *> StmtMap;
@@ -1371,7 +1385,7 @@ private:
   InvariantEquivClassesTy InvariantEquivClasses;
 
   /// @brief Scop constructor; invoked from ScopInfo::buildScop.
-  Scop(Region &R, ScalarEvolution &SE, isl_ctx *ctx, unsigned MaxLoopDepth);
+  Scop(Region &R, ScalarEvolution &SE, unsigned MaxLoopDepth);
 
   /// @brief Get or create the access function set in a BasicBlock
   AccFuncSetType &getOrCreateAccessFunctions(const BasicBlock *BB) {
@@ -1911,6 +1925,9 @@ public:
   /// @return The isl context of this static control part.
   isl_ctx *getIslCtx() const;
 
+  /// @brief Directly return the shared_ptr of the context.
+  const std::shared_ptr<isl_ctx> &getSharedIslCtx() const { return IslCtx; }
+
   /// @brief Compute the isl representation for the SCEV @p
   ///
   /// @param BB An (optional) basic block in which the isl_pw_aff is computed.
@@ -2010,7 +2027,6 @@ class ScopInfo : public RegionPass {
 
   // The Scop
   std::unique_ptr<Scop> scop;
-  isl_ctx *ctx;
 
   // Clear the context.
   void clear();
@@ -2040,11 +2056,13 @@ class ScopInfo : public RegionPass {
   /// @param R          The region on which to build the data access dictionary.
   /// @param BoxedLoops The set of loops that are overapproximated in @p R.
   /// @param ScopRIL    The required invariant loads equivalence classes.
+  /// @param InsnToMemAcc The Instruction to MemoryAccess mapping
   /// @returns True if the access could be built, False otherwise.
   bool
   buildAccessMultiDimParam(MemAccInst Inst, Loop *L, Region *R,
                            const ScopDetection::BoxedLoopsSetTy *BoxedLoops,
-                           const InvariantLoadsSetTy &ScopRIL);
+                           const InvariantLoadsSetTy &ScopRIL,
+                           const MapInsnToMemAcc &InsnToMemAcc);
 
   /// @brief Build a single-dimensional parameteric sized MemoryAccess
   ///        from the Load/Store instruction.
@@ -2065,9 +2083,11 @@ class ScopInfo : public RegionPass {
   /// @param R          The region on which to build the data access dictionary.
   /// @param BoxedLoops The set of loops that are overapproximated in @p R.
   /// @param ScopRIL    The required invariant loads equivalence classes.
+  /// @param InsnToMemAcc The Instruction to MemoryAccess mapping.
   void buildMemoryAccess(MemAccInst Inst, Loop *L, Region *R,
                          const ScopDetection::BoxedLoopsSetTy *BoxedLoops,
-                         const InvariantLoadsSetTy &ScopRIL);
+                         const InvariantLoadsSetTy &ScopRIL,
+                         const MapInsnToMemAcc &InsnToMemAcc);
 
   /// @brief Analyze and extract the cross-BB scalar dependences (or,
   ///        dataflow dependencies) of an instruction.
@@ -2093,9 +2113,11 @@ class ScopInfo : public RegionPass {
 
   /// @brief Build the access functions for the subregion @p SR.
   ///
-  /// @param R  The SCoP region.
-  /// @param SR A subregion of @p R.
-  void buildAccessFunctions(Region &R, Region &SR);
+  /// @param R            The SCoP region.
+  /// @param SR           A subregion of @p R.
+  /// @param InsnToMemAcc The Instruction to MemoryAccess mapping.
+  void buildAccessFunctions(Region &R, Region &SR,
+                            const MapInsnToMemAcc &InsnToMemAcc);
 
   /// @brief Create ScopStmt for all BBs and non-affine subregions of @p SR.
   ///
@@ -2110,9 +2132,11 @@ class ScopInfo : public RegionPass {
   ///
   /// @param R                  The SCoP region.
   /// @param BB                 A basic block in @p R.
+  /// @param InsnToMemAcc       The Instruction to MemoryAccess mapping.
   /// @param NonAffineSubRegion The non affine sub-region @p BB is in.
   /// @param IsExitBlock        Flag to indicate that @p BB is in the exit BB.
   void buildAccessFunctions(Region &R, BasicBlock &BB,
+                            const MapInsnToMemAcc &InsnToMemAcc,
                             Region *NonAffineSubRegion = nullptr,
                             bool IsExitBlock = false);
 

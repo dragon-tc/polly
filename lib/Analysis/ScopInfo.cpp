@@ -182,7 +182,7 @@ ScopArrayInfo::ScopArrayInfo(Value *BasePtr, Type *ElementType, isl_ctx *Ctx,
       getIslCompatibleName("MemRef_", BasePtr, Kind == MK_PHI ? "__phi" : "");
   Id = isl_id_alloc(Ctx, BasePtrName.c_str(), this);
 
-  updateSizes(Sizes, ElementType);
+  updateSizes(Sizes);
   BasePtrOriginSAI = identifyBasePtrOriginSAI(S, BasePtr);
   if (BasePtrOriginSAI)
     const_cast<ScopArrayInfo *>(BasePtrOriginSAI)->addDerivedSAI(this);
@@ -195,21 +195,25 @@ __isl_give isl_space *ScopArrayInfo::getSpace() const {
   return Space;
 }
 
-bool ScopArrayInfo::updateSizes(ArrayRef<const SCEV *> NewSizes,
-                                Type *NewElementType) {
+void ScopArrayInfo::updateElementType(Type *NewElementType) {
+  if (NewElementType == ElementType)
+    return;
+
   auto OldElementSize = DL.getTypeAllocSizeInBits(ElementType);
   auto NewElementSize = DL.getTypeAllocSizeInBits(NewElementType);
 
-  if (NewElementSize != OldElementSize) {
-    if (NewElementSize % OldElementSize == 0 &&
-        NewElementSize < OldElementSize) {
-      ElementType = NewElementType;
-    } else {
-      auto GCD = GreatestCommonDivisor64(NewElementSize, OldElementSize);
-      ElementType = IntegerType::get(ElementType->getContext(), GCD);
-    }
-  }
+  if (NewElementSize == OldElementSize)
+    return;
 
+  if (NewElementSize % OldElementSize == 0 && NewElementSize < OldElementSize) {
+    ElementType = NewElementType;
+  } else {
+    auto GCD = GreatestCommonDivisor64(NewElementSize, OldElementSize);
+    ElementType = IntegerType::get(ElementType->getContext(), GCD);
+  }
+}
+
+bool ScopArrayInfo::updateSizes(ArrayRef<const SCEV *> NewSizes) {
   int SharedDims = std::min(NewSizes.size(), DimensionSizes.size());
   int ExtraDimsNew = NewSizes.size() - SharedDims;
   int ExtraDimsOld = DimensionSizes.size() - SharedDims;
@@ -290,12 +294,16 @@ const ScopArrayInfo *ScopArrayInfo::getFromId(isl_id *Id) {
 }
 
 void MemoryAccess::updateDimensionality() {
-  auto ArraySpace = getScopArrayInfo()->getSpace();
+  auto *SAI = getScopArrayInfo();
+  auto ArraySpace = SAI->getSpace();
   auto AccessSpace = isl_space_range(isl_map_get_space(AccessRelation));
+  auto *Ctx = isl_space_get_ctx(AccessSpace);
 
   auto DimsArray = isl_space_dim(ArraySpace, isl_dim_set);
   auto DimsAccess = isl_space_dim(AccessSpace, isl_dim_set);
   auto DimsMissing = DimsArray - DimsAccess;
+
+  unsigned ArrayElemSize = SAI->getElemSizeInBytes();
 
   auto Map = isl_map_from_domain_and_range(
       isl_set_universe(AccessSpace),
@@ -309,12 +317,29 @@ void MemoryAccess::updateDimensionality() {
 
   AccessRelation = isl_map_apply_range(AccessRelation, Map);
 
+  // For the non delinearized arrays, divide the access function of the last
+  // subscript by the size of the elements in the array.
+  //
+  // A stride one array access in C expressed as A[i] is expressed in
+  // LLVM-IR as something like A[i * elementsize]. This hides the fact that
+  // two subsequent values of 'i' index two values that are stored next to
+  // each other in memory. By this division we make this characteristic
+  // obvious again. If the base pointer was accessed with offsets not divisible
+  // by the accesses element size, we will have choosen a smaller ArrayElemSize
+  // that divides the offsets of all accesses to this base pointer.
+  if (DimsAccess == 1) {
+    isl_val *V = isl_val_int_from_si(Ctx, ArrayElemSize);
+    AccessRelation = isl_map_floordiv_val(AccessRelation, V);
+  }
+
+  if (!isAffine())
+    computeBoundsOnAccessRelation(ArrayElemSize);
+
   // Introduce multi-element accesses in case the type loaded by this memory
   // access is larger than the canonical element type of the array.
   //
   // An access ((float *)A)[i] to an array char *A is modeled as
   // {[i] -> A[o] : 4 i <= o <= 4 i + 3
-  unsigned ArrayElemSize = getScopArrayInfo()->getElemSizeInBytes();
   if (ElemBytes > ArrayElemSize) {
     assert(ElemBytes % ArrayElemSize == 0 &&
            "Loaded element size should be multiple of canonical element size");
@@ -324,24 +349,20 @@ void MemoryAccess::updateDimensionality() {
     for (unsigned i = 0; i < DimsArray - 1; i++)
       Map = isl_map_equate(Map, isl_dim_in, i, isl_dim_out, i);
 
-    isl_ctx *Ctx;
     isl_constraint *C;
     isl_local_space *LS;
 
     LS = isl_local_space_from_space(isl_map_get_space(Map));
-    Ctx = isl_map_get_ctx(Map);
     int Num = ElemBytes / getScopArrayInfo()->getElemSizeInBytes();
 
     C = isl_constraint_alloc_inequality(isl_local_space_copy(LS));
     C = isl_constraint_set_constant_val(C, isl_val_int_from_si(Ctx, Num - 1));
-    C = isl_constraint_set_coefficient_si(C, isl_dim_in,
-                                          DimsArray - 1 - DimsMissing, Num);
+    C = isl_constraint_set_coefficient_si(C, isl_dim_in, DimsArray - 1, 1);
     C = isl_constraint_set_coefficient_si(C, isl_dim_out, DimsArray - 1, -1);
     Map = isl_map_add_constraint(Map, C);
 
     C = isl_constraint_alloc_inequality(LS);
-    C = isl_constraint_set_coefficient_si(C, isl_dim_in,
-                                          DimsArray - 1 - DimsMissing, -Num);
+    C = isl_constraint_set_coefficient_si(C, isl_dim_in, DimsArray - 1, -1);
     C = isl_constraint_set_coefficient_si(C, isl_dim_out, DimsArray - 1, 1);
     C = isl_constraint_set_constant_val(C, isl_val_int_from_si(Ctx, 0));
     Map = isl_map_add_constraint(Map, C);
@@ -677,6 +698,8 @@ __isl_give isl_map *MemoryAccess::foldAccess(__isl_take isl_map *AccessRelation,
 
 /// @brief Check if @p Expr is divisible by @p Size.
 static bool isDivisible(const SCEV *Expr, unsigned Size, ScalarEvolution &SE) {
+  if (Size == 1)
+    return true;
 
   // Only one factor needs to be divisible.
   if (auto *MulExpr = dyn_cast<SCEVMulExpr>(Expr)) {
@@ -715,37 +738,15 @@ void MemoryAccess::buildAccessRelation(const ScopArrayInfo *SAI) {
     AccessRelation = isl_map_from_basic_map(createBasicAccessMap(Statement));
     AccessRelation =
         isl_map_set_tuple_id(AccessRelation, isl_dim_out, BaseAddrId);
-
-    computeBoundsOnAccessRelation(getElemSizeInBytes());
     return;
   }
 
-  Scop &S = *getStatement()->getParent();
   isl_space *Space = isl_space_alloc(Ctx, 0, Statement->getNumIterators(), 0);
   AccessRelation = isl_map_universe(Space);
 
   for (int i = 0, Size = Subscripts.size(); i < Size; ++i) {
     isl_pw_aff *Affine = Statement->getPwAff(Subscripts[i]);
-
-    if (Size == 1) {
-      // For the non delinearized arrays, divide the access function of the last
-      // subscript by the size of the elements in the array.
-      //
-      // A stride one array access in C expressed as A[i] is expressed in
-      // LLVM-IR as something like A[i * elementsize]. This hides the fact that
-      // two subsequent values of 'i' index two values that are stored next to
-      // each other in memory. By this division we make this characteristic
-      // obvious again. However, if the index is not divisible by the element
-      // size we will bail out.
-      isl_val *v = isl_val_int_from_si(Ctx, getElemSizeInBytes());
-      Affine = isl_pw_aff_scale_down_val(Affine, v);
-
-      if (!isDivisible(Subscripts[0], getElemSizeInBytes(), *S.getSE()))
-        S.invalidate(ALIGNMENT, AccessInstruction->getDebugLoc());
-    }
-
     isl_map *SubscriptMap = isl_map_from_pw_aff(Affine);
-
     AccessRelation = isl_map_flat_range_product(AccessRelation, SubscriptMap);
   }
 
@@ -774,8 +775,11 @@ MemoryAccess::MemoryAccess(ScopStmt *Stmt, Instruction *AccessInst,
       AccessValue(AccessValue), IsAffine(Affine),
       Subscripts(Subscripts.begin(), Subscripts.end()), AccessRelation(nullptr),
       NewAccessRelation(nullptr) {
+  static const std::string TypeStrings[] = {"", "_Read", "_Write", "_MayWrite"};
+  const std::string Access = TypeStrings[Type] + utostr(Stmt->size()) + "_";
 
-  std::string IdName = "__polly_array_ref";
+  std::string IdName =
+      getIslCompatibleName(Stmt->getBaseName(), Access, BaseName);
   Id = isl_id_alloc(Stmt->getParent()->getIslCtx(), IdName.c_str(), this);
 }
 
@@ -1784,7 +1788,8 @@ void Scop::addUserContext() {
   if (UserContextStr.empty())
     return;
 
-  isl_set *UserContext = isl_set_read_from_str(IslCtx, UserContextStr.c_str());
+  isl_set *UserContext =
+      isl_set_read_from_str(getIslCtx(), UserContextStr.c_str());
   isl_space *Space = getParamSpace();
   if (isl_space_dim(Space, isl_dim_param) !=
       isl_set_dim(UserContext, isl_dim_param)) {
@@ -1848,7 +1853,7 @@ void Scop::buildInvariantEquivalenceClasses(ScopDetection &SD) {
 }
 
 void Scop::buildContext() {
-  isl_space *Space = isl_space_params_alloc(IslCtx, 0);
+  isl_space *Space = isl_space_params_alloc(getIslCtx(), 0);
   Context = isl_set_universe(isl_space_copy(Space));
   AssumedContext = isl_set_universe(Space);
 }
@@ -1865,7 +1870,7 @@ void Scop::addParameterBounds() {
 
 void Scop::realignParams() {
   // Add all parameters into a common model.
-  isl_space *Space = isl_space_params_alloc(IslCtx, ParameterIds.size());
+  isl_space *Space = isl_space_params_alloc(getIslCtx(), ParameterIds.size());
 
   for (const auto &ParamID : ParameterIds) {
     const SCEV *Parameter = ParamID.first;
@@ -2731,13 +2736,13 @@ static unsigned getMaxLoopDepthInRegion(const Region &R, LoopInfo &LI,
   return MaxLD - MinLD + 1;
 }
 
-Scop::Scop(Region &R, ScalarEvolution &ScalarEvolution, isl_ctx *Context,
-           unsigned MaxLoopDepth)
+Scop::Scop(Region &R, ScalarEvolution &ScalarEvolution, unsigned MaxLoopDepth)
     : SE(&ScalarEvolution), R(R), IsOptimized(false),
       HasSingleExitEdge(R.getExitingBlock()), HasErrorBlock(false),
-      MaxLoopDepth(MaxLoopDepth), IslCtx(Context), Context(nullptr),
-      Affinator(this), AssumedContext(nullptr), BoundaryContext(nullptr),
-      Schedule(nullptr) {
+      MaxLoopDepth(MaxLoopDepth), IslCtx(isl_ctx_alloc(), isl_ctx_free),
+      Context(nullptr), Affinator(this), AssumedContext(nullptr),
+      BoundaryContext(nullptr), Schedule(nullptr) {
+  isl_options_set_on_error(getIslCtx(), ISL_ON_ERROR_ABORT);
   buildContext();
 }
 
@@ -2798,9 +2803,33 @@ Scop::~Scop() {
 
   for (const auto &IAClass : InvariantEquivClasses)
     isl_set_free(std::get<2>(IAClass));
+
+  // Explicitly release all Scop objects and the underlying isl objects before
+  // we relase the isl context.
+  Stmts.clear();
+  ScopArrayInfoMap.clear();
+  AccFuncMap.clear();
 }
 
 void Scop::updateAccessDimensionality() {
+  // Check all array accesses for each base pointer and find a (virtual) element
+  // size for the base pointer that divides all access functions.
+  for (auto &Stmt : *this)
+    for (auto *Access : Stmt) {
+      if (!Access->isArrayKind())
+        continue;
+      auto &SAI = ScopArrayInfoMap[std::make_pair(Access->getBaseAddr(),
+                                                  ScopArrayInfo::MK_Array)];
+      if (SAI->getNumberOfDimensions() != 1)
+        continue;
+      unsigned DivisibleSize = SAI->getElemSizeInBytes();
+      auto *Subscript = Access->getSubscript(0);
+      while (!isDivisible(Subscript, DivisibleSize, *SE))
+        DivisibleSize /= 2;
+      auto *Ty = IntegerType::get(SE->getContext(), DivisibleSize * 8);
+      SAI->updateElementType(Ty);
+    }
+
   for (auto &Stmt : *this)
     for (auto &Access : Stmt)
       Access->updateDimensionality();
@@ -2965,12 +2994,18 @@ bool Scop::isHoistableAccess(MemoryAccess *Access,
   // no base pointer origin we check that the base pointer is defined
   // outside the region.
   const ScopArrayInfo *SAI = Access->getScopArrayInfo();
-  while (auto *BasePtrOriginSAI = SAI->getBasePtrOriginSAI())
-    SAI = BasePtrOriginSAI;
-
-  if (auto *BasePtrInst = dyn_cast<Instruction>(SAI->getBasePtr()))
-    if (R.contains(BasePtrInst))
+  auto *BasePtrInst = dyn_cast<Instruction>(SAI->getBasePtr());
+  if (SAI->getBasePtrOriginSAI()) {
+    assert(BasePtrInst && R.contains(BasePtrInst));
+    if (!isa<LoadInst>(BasePtrInst))
       return false;
+    auto *BasePtrStmt = getStmtForBasicBlock(BasePtrInst->getParent());
+    assert(BasePtrStmt);
+    auto *BasePtrMA = BasePtrStmt->getArrayAccessOrNULLFor(BasePtrInst);
+    if (BasePtrMA && !isHoistableAccess(BasePtrMA, Writes))
+      return false;
+  } else if (BasePtrInst && R.contains(BasePtrInst))
+    return false;
 
   // Skip accesses in non-affine subregions as they might not be executed
   // under the same condition as the entry of the non-affine subregion.
@@ -3055,9 +3090,10 @@ Scop::getOrCreateScopArrayInfo(Value *BasePtr, Type *ElementType,
     SAI.reset(new ScopArrayInfo(BasePtr, ElementType, getIslCtx(), Sizes, Kind,
                                 DL, this));
   } else {
+    SAI->updateElementType(ElementType);
     // In case of mismatching array sizes, we bail out by setting the run-time
     // context to false.
-    if (!SAI->updateSizes(Sizes, ElementType))
+    if (!SAI->updateSizes(Sizes))
       invalidate(DELINEARIZATION, DebugLoc());
   }
   return SAI.get();
@@ -3128,8 +3164,6 @@ static std::string toString(AssumptionKind Kind) {
     return "Inbounds";
   case WRAPPING:
     return "No-overflows";
-  case ALIGNMENT:
-    return "Alignment";
   case ERRORBLOCK:
     return "No-error";
   case INFINITELOOP:
@@ -3300,7 +3334,7 @@ void Scop::print(raw_ostream &OS) const {
 
 void Scop::dump() const { print(dbgs()); }
 
-isl_ctx *Scop::getIslCtx() const { return IslCtx; }
+isl_ctx *Scop::getIslCtx() const { return IslCtx.get(); }
 
 __isl_give isl_pw_aff *Scop::getPwAff(const SCEV *E, BasicBlock *BB) {
   return Affinator.getPwAff(E, BB);
@@ -3734,8 +3768,6 @@ void ScopInfo::buildEscapingDependences(Instruction *Inst) {
   }
 }
 
-extern MapInsnToMemAcc InsnToMemAcc;
-
 bool ScopInfo::buildAccessMultiDimFixed(
     MemAccInst Inst, Loop *L, Region *R,
     const ScopDetection::BoxedLoopsSetTy *BoxedLoops,
@@ -3795,7 +3827,7 @@ bool ScopInfo::buildAccessMultiDimFixed(
 bool ScopInfo::buildAccessMultiDimParam(
     MemAccInst Inst, Loop *L, Region *R,
     const ScopDetection::BoxedLoopsSetTy *BoxedLoops,
-    const InvariantLoadsSetTy &ScopRIL) {
+    const InvariantLoadsSetTy &ScopRIL, const MapInsnToMemAcc &InsnToMemAcc) {
   Value *Address = Inst.getPointerOperand();
   Value *Val = Inst.getValueOperand();
   Type *SizeType = Val->getType();
@@ -3881,30 +3913,31 @@ void ScopInfo::buildAccessSingleDim(
 void ScopInfo::buildMemoryAccess(
     MemAccInst Inst, Loop *L, Region *R,
     const ScopDetection::BoxedLoopsSetTy *BoxedLoops,
-    const InvariantLoadsSetTy &ScopRIL) {
+    const InvariantLoadsSetTy &ScopRIL, const MapInsnToMemAcc &InsnToMemAcc) {
 
   if (buildAccessMultiDimFixed(Inst, L, R, BoxedLoops, ScopRIL))
     return;
 
-  if (buildAccessMultiDimParam(Inst, L, R, BoxedLoops, ScopRIL))
+  if (buildAccessMultiDimParam(Inst, L, R, BoxedLoops, ScopRIL, InsnToMemAcc))
     return;
 
   buildAccessSingleDim(Inst, L, R, BoxedLoops, ScopRIL);
 }
 
-void ScopInfo::buildAccessFunctions(Region &R, Region &SR) {
+void ScopInfo::buildAccessFunctions(Region &R, Region &SR,
+                                    const MapInsnToMemAcc &InsnToMemAcc) {
 
   if (SD->isNonAffineSubRegion(&SR, &R)) {
     for (BasicBlock *BB : SR.blocks())
-      buildAccessFunctions(R, *BB, &SR);
+      buildAccessFunctions(R, *BB, InsnToMemAcc, &SR);
     return;
   }
 
   for (auto I = SR.element_begin(), E = SR.element_end(); I != E; ++I)
     if (I->isSubRegion())
-      buildAccessFunctions(R, *I->getNodeAs<Region>());
+      buildAccessFunctions(R, *I->getNodeAs<Region>(), InsnToMemAcc);
     else
-      buildAccessFunctions(R, *I->getNodeAs<BasicBlock>());
+      buildAccessFunctions(R, *I->getNodeAs<BasicBlock>(), InsnToMemAcc);
 }
 
 void ScopInfo::buildStmts(Region &R, Region &SR) {
@@ -3922,6 +3955,7 @@ void ScopInfo::buildStmts(Region &R, Region &SR) {
 }
 
 void ScopInfo::buildAccessFunctions(Region &R, BasicBlock &BB,
+                                    const MapInsnToMemAcc &InsnToMemAcc,
                                     Region *NonAffineSubRegion,
                                     bool IsExitBlock) {
   // We do not build access functions for error blocks, as they may contain
@@ -3951,7 +3985,7 @@ void ScopInfo::buildAccessFunctions(Region &R, BasicBlock &BB,
     //       there might be other invariant accesses that will be hoisted and
     //       that would allow to make a non-affine access affine.
     if (auto MemInst = MemAccInst::dyn_cast(Inst))
-      buildMemoryAccess(MemInst, L, &R, BoxedLoops, ScopRIL);
+      buildMemoryAccess(MemInst, L, &R, BoxedLoops, ScopRIL, InsnToMemAcc);
 
     if (isIgnoredIntrinsic(&Inst))
       continue;
@@ -4126,10 +4160,10 @@ void ScopInfo::addPHIReadAccess(PHINode *PHI) {
 
 void ScopInfo::buildScop(Region &R, AssumptionCache &AC) {
   unsigned MaxLoopDepth = getMaxLoopDepthInRegion(R, *LI, *SD);
-  scop.reset(new Scop(R, *SE, ctx, MaxLoopDepth));
+  scop.reset(new Scop(R, *SE, MaxLoopDepth));
 
   buildStmts(R, R);
-  buildAccessFunctions(R, R);
+  buildAccessFunctions(R, R, *SD->getInsnToMemAccMap(&R));
 
   // In case the region does not have an exiting block we will later (during
   // code generation) split the exit block. This will move potential PHI nodes
@@ -4139,7 +4173,8 @@ void ScopInfo::buildScop(Region &R, AssumptionCache &AC) {
   // accesses. Note that we do not model anything in the exit block if we have
   // an exiting block in the region, as there will not be any splitting later.
   if (!R.getExitingBlock())
-    buildAccessFunctions(R, *R.getExit(), nullptr, /* IsExitBlock */ true);
+    buildAccessFunctions(R, *R.getExit(), *SD->getInsnToMemAccMap(&R), nullptr,
+                         /* IsExitBlock */ true);
 
   scop->init(*AA, AC, *SD, *DT, *LI);
 }
@@ -4156,15 +4191,9 @@ void ScopInfo::print(raw_ostream &OS, const Module *) const {
 void ScopInfo::clear() { scop.reset(); }
 
 //===----------------------------------------------------------------------===//
-ScopInfo::ScopInfo() : RegionPass(ID) {
-  ctx = isl_ctx_alloc();
-  isl_options_set_on_error(ctx, ISL_ON_ERROR_ABORT);
-}
+ScopInfo::ScopInfo() : RegionPass(ID) {}
 
-ScopInfo::~ScopInfo() {
-  clear();
-  isl_ctx_free(ctx);
-}
+ScopInfo::~ScopInfo() { clear(); }
 
 void ScopInfo::getAnalysisUsage(AnalysisUsage &AU) const {
   AU.addRequired<LoopInfoWrapperPass>();
