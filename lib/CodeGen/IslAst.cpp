@@ -71,33 +71,6 @@ static cl::opt<bool> DetectParallel("polly-ast-detect-parallel",
                                     cl::init(false), cl::ZeroOrMore,
                                     cl::cat(PollyCategory));
 
-namespace polly {
-class IslAst {
-public:
-  static IslAst *create(Scop *Scop, const Dependences &D);
-  ~IslAst();
-
-  /// Print a source code representation of the program.
-  void pprint(llvm::raw_ostream &OS);
-
-  __isl_give isl_ast_node *getAst();
-
-  /// @brief Get the run-time conditions for the Scop.
-  __isl_give isl_ast_expr *getRunCondition();
-
-private:
-  Scop *S;
-  isl_ast_node *Root;
-  isl_ast_expr *RunCondition;
-  std::shared_ptr<isl_ctx> Ctx;
-
-  IslAst(Scop *Scop);
-  void init(const Dependences &D);
-
-  void buildRunCondition(__isl_keep isl_ast_build *Build);
-};
-} // End namespace polly.
-
 /// @brief Free an IslAstUserPayload object pointed to by @p Ptr
 static void freeIslAstUserPayload(void *Ptr) {
   delete ((IslAstInfo::IslAstUserPayload *)Ptr);
@@ -282,15 +255,42 @@ astBuildAfterFor(__isl_take isl_ast_node *Node, __isl_keep isl_ast_build *Build,
   // tested for parallelism. Test them here to ensure we check all innermost
   // loops for parallelism.
   if (Payload->IsInnermost && BuildInfo->InParallelFor) {
-    if (Payload->IsOutermostParallel)
+    if (Payload->IsOutermostParallel) {
       Payload->IsInnermostParallel = true;
-    else
-      Payload->IsInnermostParallel =
-          astScheduleDimIsParallel(Build, BuildInfo->Deps, Payload);
+    } else {
+      if (PollyVectorizerChoice == VECTORIZER_NONE)
+        Payload->IsInnermostParallel =
+            astScheduleDimIsParallel(Build, BuildInfo->Deps, Payload);
+    }
   }
   if (Payload->IsOutermostParallel)
     BuildInfo->InParallelFor = false;
 
+  isl_id_free(Id);
+  return Node;
+}
+
+static isl_stat astBuildBeforeMark(__isl_keep isl_id *MarkId,
+                                   __isl_keep isl_ast_build *Build,
+                                   void *User) {
+  if (!MarkId)
+    return isl_stat_error;
+
+  AstBuildUserInfo *BuildInfo = (AstBuildUserInfo *)User;
+  if (!strcmp(isl_id_get_name(MarkId), "SIMD"))
+    BuildInfo->InParallelFor = true;
+
+  return isl_stat_ok;
+}
+
+static __isl_give isl_ast_node *
+astBuildAfterMark(__isl_take isl_ast_node *Node,
+                  __isl_keep isl_ast_build *Build, void *User) {
+  assert(isl_ast_node_get_type(Node) == isl_ast_node_mark);
+  AstBuildUserInfo *BuildInfo = (AstBuildUserInfo *)User;
+  auto *Id = isl_ast_node_mark_get_id(Node);
+  if (!strcmp(isl_id_get_name(Id), "SIMD"))
+    BuildInfo->InParallelFor = false;
   isl_id_free(Id);
   return Node;
 }
@@ -410,6 +410,12 @@ void IslAst::init(const Dependences &D) {
                                               &BuildInfo);
     Build =
         isl_ast_build_set_after_each_for(Build, &astBuildAfterFor, &BuildInfo);
+
+    Build = isl_ast_build_set_before_each_mark(Build, &astBuildBeforeMark,
+                                               &BuildInfo);
+
+    Build = isl_ast_build_set_after_each_mark(Build, &astBuildAfterMark,
+                                              &BuildInfo);
   }
 
   buildRunCondition(Build);
