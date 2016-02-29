@@ -327,6 +327,9 @@ public:
   /// normal scalar array modeling.
   bool isPHIKind() const { return Kind == MK_PHI; };
 
+  /// @brief Is this array info modeling an array?
+  bool isArrayKind() const { return Kind == MK_Array; };
+
   /// @brief Dump a readable representation to stderr.
   void dump() const;
 
@@ -663,6 +666,7 @@ public:
   /// @param IncomingValue The value when reacing the PHI from the @p
   ///                      IncomingBlock.
   void addIncoming(BasicBlock *IncomingBlock, Value *IncomingValue) {
+    assert(!isRead());
     assert(isAnyPHIKind());
     Incoming.emplace_back(std::make_pair(IncomingBlock, IncomingValue));
   }
@@ -1075,6 +1079,16 @@ public:
 
   /// @brief Return true if this statement represents a whole region.
   bool isRegionStmt() const { return R != nullptr; }
+
+  /// @brief Return a BasicBlock from this statement.
+  ///
+  /// For block statements, it returns the BasicBlock itself. For subregion
+  /// statements, return its entry block.
+  BasicBlock *getEntryBlock() const;
+
+  /// @brief Return RegionInfo's RegionNode for this statements' BB or
+  ///        subregion.
+  RegionNode *getRegionNode() const;
 
   /// @brief Return true if this statement does not contain any accesses.
   bool isEmpty() const { return MemAccs.empty(); }
@@ -1858,13 +1872,24 @@ public:
   /// @brief Get an isl string representing the boundary context.
   std::string getBoundaryContextStr() const;
 
-  /// @brief Return the stmt for the given @p BB or nullptr if none.
-  ScopStmt *getStmtForBasicBlock(BasicBlock *BB) const;
+  /// @brief Return the ScopStmt for the given @p BB or nullptr if there is
+  ///        none.
+  ScopStmt *getStmtFor(BasicBlock *BB) const;
+
+  /// @brief Return the ScopStmt that represents the Region @p R, or nullptr if
+  ///        it is not represented by any statement in this Scop.
+  ScopStmt *getStmtFor(Region *R) const;
 
   /// @brief Return the ScopStmt that represents @p RN; can return nullptr if
-  /// the RegionNode is not within the SCoP or has been removed due to
-  /// simplifications.
-  ScopStmt *getStmtForRegionNode(RegionNode *RN) const;
+  ///        the RegionNode is not within the SCoP or has been removed due to
+  ///        simplifications.
+  ScopStmt *getStmtFor(RegionNode *RN) const;
+
+  /// @brief Return the ScopStmt an instruction belongs to, or nullptr if it
+  ///        does not belong to any statement in this Scop.
+  ScopStmt *getStmtFor(Instruction *Inst) const {
+    return getStmtFor(Inst->getParent());
+  }
 
   /// @brief Return the number of statements in the SCoP.
   size_t getSize() const { return Stmts.size(); }
@@ -1905,6 +1930,14 @@ public:
   /// @param Kind      The kind of array info object.
   const ScopArrayInfo *getScopArrayInfo(Value *BasePtr,
                                         ScopArrayInfo::MemoryKind Kind);
+
+  /// @brief Invalidate ScopArrayInfo object for base address.
+  ///
+  /// @param BasePtr The base pointer of the ScopArrayInfo object to invalidate.
+  /// @param Kind    The Kind of the ScopArrayInfo object.
+  void invalidateScopArrayInfo(Value *BasePtr, ScopArrayInfo::MemoryKind Kind) {
+    ScopArrayInfoMap.erase(std::make_pair(BasePtr, Kind));
+  }
 
   void setContext(isl_set *NewContext);
 
@@ -2030,6 +2063,12 @@ class ScopInfo : public RegionPass {
   /// @brief The ScalarEvolution to help building Scop.
   ScalarEvolution *SE;
 
+  /// @brief Set of instructions that might read any memory location.
+  SmallVector<Instruction *, 16> GlobalReads;
+
+  /// @brief Set of all accessed array base pointers.
+  SmallSetVector<Value *, 16> ArrayBasePointers;
+
   // The Scop
   std::unique_ptr<Scop> scop;
 
@@ -2083,6 +2122,19 @@ class ScopInfo : public RegionPass {
   bool buildAccessMemIntrinsic(MemAccInst Inst, Loop *L, Region *R,
                                const ScopDetection::BoxedLoopsSetTy *BoxedLoops,
                                const InvariantLoadsSetTy &ScopRIL);
+
+  /// @brief Try to build a MemoryAccess for a call instruction.
+  ///
+  /// @param Inst       The call instruction that access the memory
+  /// @param L          The parent loop of the instruction
+  /// @param R          The region on which to build the data access dictionary.
+  /// @param BoxedLoops The set of loops that are overapproximated in @p R.
+  /// @param ScopRIL    The required invariant loads equivalence classes.
+  ///
+  /// @returns True if the access could be built, False otherwise.
+  bool buildAccessCallInst(MemAccInst Inst, Loop *L, Region *R,
+                           const ScopDetection::BoxedLoopsSetTy *BoxedLoops,
+                           const InvariantLoadsSetTy &ScopRIL);
 
   /// @brief Build a single-dimensional parameteric sized MemoryAccess
   ///        from the Load/Store instruction.
