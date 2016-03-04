@@ -27,6 +27,7 @@
 #include "llvm/Analysis/RegionPass.h"
 #include "isl/aff.h"
 #include "isl/ctx.h"
+#include "isl/set.h"
 
 #include <deque>
 #include <forward_list>
@@ -80,6 +81,9 @@ enum AssumptionKind {
   DELINEARIZATION,
   ERROR_DOMAINCONJUNCTS,
 };
+
+/// @brief Enum to distinguish between assumptions and restrictions.
+enum AssumptionSign { AS_ASSUMPTION, AS_RESTRICTION };
 
 /// Maps from a loop to the affine function expressing its backedge taken count.
 /// The backedge taken count already enough to express iteration domain as we
@@ -315,6 +319,9 @@ public:
   /// @brief Return the isl id for the base pointer.
   __isl_give isl_id *getBasePtrId() const;
 
+  /// @brief Is this array info modeling an llvm::Value?
+  bool isValueKind() const { return Kind == MK_Value; };
+
   /// @brief Is this array info modeling special PHI node memory?
   ///
   /// During code generation of PHI nodes, there is a need for two kinds of
@@ -326,6 +333,9 @@ public:
   /// attribute to distinguish the PHI node specific array modeling from the
   /// normal scalar array modeling.
   bool isPHIKind() const { return Kind == MK_PHI; };
+
+  /// @brief Is this array info modeling an MK_ExitPHI?
+  bool isExitPHIKind() const { return Kind == MK_ExitPHI; };
 
   /// @brief Is this array info modeling an array?
   bool isArrayKind() const { return Kind == MK_Array; };
@@ -1334,16 +1344,13 @@ private:
   /// this scop and that need to be code generated as a run-time test.
   isl_set *AssumedContext;
 
-  /// @brief The boundary assumptions under which this scop was built.
+  /// @brief The restrictions under which this SCoP was built.
   ///
-  /// The boundary context is similar to the assumed context as it contains
-  /// constraints over the parameters we assume to be true. However, the
-  /// boundary context is less useful for dependence analysis and
-  /// simplification purposes as it contains only constraints that affect the
-  /// boundaries of the parameter ranges. As these constraints can become quite
-  /// complex, the boundary context and the assumed context are separated as a
-  /// meassure to save compile time.
-  isl_set *BoundaryContext;
+  /// The invalid context is similar to the assumed context as it contains
+  /// constraints over the parameters. However, while we need the constraints
+  /// in the assumed context to be "true" the constraints in the invalid context
+  /// need to be "false". Otherwise they behave the same.
+  isl_set *InvalidContext;
 
   /// @brief The schedule of the SCoP
   ///
@@ -1404,7 +1411,7 @@ private:
   InvariantEquivClassesTy InvariantEquivClasses;
 
   /// @brief Scop constructor; invoked from ScopInfo::buildScop.
-  Scop(Region &R, ScalarEvolution &SE, unsigned MaxLoopDepth);
+  Scop(Region &R, ScalarEvolution &SE, LoopInfo &LI, unsigned MaxLoopDepth);
 
   /// @brief Get or create the access function set in a BasicBlock
   AccFuncSetType &getOrCreateAccessFunctions(const BasicBlock *BB) {
@@ -1550,8 +1557,8 @@ private:
   /// @brief Build the Context of the Scop.
   void buildContext();
 
-  /// @brief Build the BoundaryContext based on the wrapping of expressions.
-  void buildBoundaryContext();
+  /// @brief Add the restrictions based on the wrapping of expressions.
+  void addWrappingContext();
 
   /// @brief Add user provided parameter constraints to context (source code).
   void addUserAssumptions(AssumptionCache &AC, DominatorTree &DT, LoopInfo &LI);
@@ -1562,7 +1569,7 @@ private:
   /// @brief Add the bounds of the parameters to the context.
   void addParameterBounds();
 
-  /// @brief Simplify the assumed and boundary context.
+  /// @brief Simplify the assumed and invalid context.
   void simplifyContexts();
 
   /// @brief Get the representing SCEV for @p S if applicable, otherwise @p S.
@@ -1790,14 +1797,6 @@ public:
   /// @return The assumed context of this Scop.
   __isl_give isl_set *getAssumedContext() const;
 
-  /// @brief Get the runtime check context for this Scop.
-  ///
-  /// The runtime check context contains all constraints that have to
-  /// hold at runtime for the optimized version to be executed.
-  ///
-  /// @return The runtime check context of this Scop.
-  __isl_give isl_set *getRuntimeCheckContext() const;
-
   /// @brief Return true if the optimized SCoP can be executed.
   ///
   /// In addition to the runtime check context this will also utilize the domain
@@ -1808,14 +1807,18 @@ public:
 
   /// @brief Track and report an assumption.
   ///
-  /// Use 'clang -Rpass-analysis=polly-scops' or 'opt -pass-remarks=polly-scops'
-  /// to output the assumptions.
+  /// Use 'clang -Rpass-analysis=polly-scops' or 'opt
+  /// -pass-remarks-analysis=polly-scops' to output the assumptions.
   ///
   /// @param Kind The assumption kind describing the underlying cause.
   /// @param Set  The relations between parameters that are assumed to hold.
   /// @param Loc  The location in the source that caused this assumption.
-  void trackAssumption(AssumptionKind Kind, __isl_keep isl_set *Set,
-                       DebugLoc Loc);
+  /// @param Sign Enum to indicate if the assumptions in @p Set are positive
+  ///             (needed/assumptions) or negative (invalid/restrictions).
+  ///
+  /// @returns True if the assumption is not trivial.
+  bool trackAssumption(AssumptionKind Kind, __isl_keep isl_set *Set,
+                       DebugLoc Loc, AssumptionSign Sign);
 
   /// @brief Add assumptions to assumed context.
   ///
@@ -1831,8 +1834,10 @@ public:
   /// @param Kind The assumption kind describing the underlying cause.
   /// @param Set  The relations between parameters that are assumed to hold.
   /// @param Loc  The location in the source that caused this assumption.
-  void addAssumption(AssumptionKind Kind, __isl_take isl_set *Set,
-                     DebugLoc Loc);
+  /// @param Sign Enum to indicate if the assumptions in @p Set are positive
+  ///             (needed/assumptions) or negative (invalid/restrictions).
+  void addAssumption(AssumptionKind Kind, __isl_take isl_set *Set, DebugLoc Loc,
+                     AssumptionSign Sign);
 
   /// @brief Mark the scop as invalid.
   ///
@@ -1845,10 +1850,15 @@ public:
   /// @param Loc  The location in the source that triggered .
   void invalidate(AssumptionKind Kind, DebugLoc Loc);
 
-  /// @brief Get the boundary context for this Scop.
+  /// @brief Get the invalid context for this Scop.
   ///
-  /// @return The boundary context of this Scop.
-  __isl_give isl_set *getBoundaryContext() const;
+  /// @return The invalid context of this Scop.
+  __isl_give isl_set *getInvalidContext() const;
+
+  /// @brief Return true if and only if the InvalidContext is trivial (=empty).
+  bool hasTrivialInvalidContext() const {
+    return isl_set_is_empty(InvalidContext);
+  }
 
   /// @brief Build the alias checks for this SCoP.
   void buildAliasChecks(AliasAnalysis &AA);
@@ -1869,8 +1879,8 @@ public:
   /// @brief Get an isl string representing the assumed context.
   std::string getAssumedContextStr() const;
 
-  /// @brief Get an isl string representing the boundary context.
-  std::string getBoundaryContextStr() const;
+  /// @brief Get an isl string representing the invalid context.
+  std::string getInvalidContextStr() const;
 
   /// @brief Return the ScopStmt for the given @p BB or nullptr if there is
   ///        none.

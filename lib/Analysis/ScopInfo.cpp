@@ -609,9 +609,9 @@ void MemoryAccess::assumeNoOutOfBound() {
   // bail out more often than strictly necessary.
   Outside = isl_set_remove_divs(Outside);
   Outside = isl_set_complement(Outside);
-  Statement->getParent()->addAssumption(
-      INBOUNDS, Outside,
-      getAccessInstruction() ? getAccessInstruction()->getDebugLoc() : nullptr);
+  auto &Loc = getAccessInstruction() ? getAccessInstruction()->getDebugLoc()
+                                     : DebugLoc();
+  Statement->getParent()->addAssumption(INBOUNDS, Outside, Loc, AS_ASSUMPTION);
   isl_space_free(Space);
 }
 
@@ -1313,12 +1313,15 @@ void ScopStmt::deriveAssumptionsFromGEP(GetElementPtrInst *GEP,
 
   assert(IndexOffset <= 1 && "Unexpected large index offset");
 
+  auto *NotExecuted = isl_set_complement(isl_set_params(getDomain()));
   for (size_t i = 0; i < Sizes.size(); i++) {
     auto *Expr = Subscripts[i + IndexOffset];
     auto Size = Sizes[i];
 
+    auto *Scope = SD.getLI()->getLoopFor(getEntryBlock());
     InvariantLoadsSetTy AccessILS;
-    if (!isAffineExpr(&Parent.getRegion(), Expr, SE, nullptr, &AccessILS))
+    if (!isAffineExpr(&Parent.getRegion(), Scope, Expr, SE, nullptr,
+                      &AccessILS))
       continue;
 
     bool NonAffine = false;
@@ -1340,17 +1343,18 @@ void ScopStmt::deriveAssumptionsFromGEP(GetElementPtrInst *GEP,
     OutOfBound = isl_set_intersect(getDomain(), OutOfBound);
     OutOfBound = isl_set_params(OutOfBound);
     isl_set *InBound = isl_set_complement(OutOfBound);
-    isl_set *Executed = isl_set_params(getDomain());
 
     // A => B == !A or B
     isl_set *InBoundIfExecuted =
-        isl_set_union(isl_set_complement(Executed), InBound);
+        isl_set_union(isl_set_copy(NotExecuted), InBound);
 
     InBoundIfExecuted = isl_set_coalesce(InBoundIfExecuted);
-    Parent.addAssumption(INBOUNDS, InBoundIfExecuted, GEP->getDebugLoc());
+    Parent.addAssumption(INBOUNDS, InBoundIfExecuted, GEP->getDebugLoc(),
+                         AS_ASSUMPTION);
   }
 
   isl_local_space_free(LSpace);
+  isl_set_free(NotExecuted);
 }
 
 void ScopStmt::deriveAssumptions(BasicBlock *Block, ScopDetection &SD) {
@@ -1762,37 +1766,12 @@ isl_set *Scop::addNonEmptyDomainConstraints(isl_set *C) const {
   return isl_set_intersect_params(C, DomainContext);
 }
 
-void Scop::buildBoundaryContext() {
-  if (IgnoreIntegerWrapping) {
-    BoundaryContext = isl_set_universe(getParamSpace());
+void Scop::addWrappingContext() {
+  if (IgnoreIntegerWrapping)
     return;
-  }
 
-  BoundaryContext = Affinator.getWrappingContext();
-
-  // The isl_set_complement operation used to create the boundary context
-  // can possibly become very expensive. We bound the compile time of
-  // this operation by setting a compute out.
-  //
-  // TODO: We can probably get around using isl_set_complement and directly
-  // AST generate BoundaryContext.
-  long MaxOpsOld = isl_ctx_get_max_operations(getIslCtx());
-  isl_ctx_reset_operations(getIslCtx());
-  isl_ctx_set_max_operations(getIslCtx(), 300000);
-  isl_options_set_on_error(getIslCtx(), ISL_ON_ERROR_CONTINUE);
-
-  BoundaryContext = isl_set_complement(BoundaryContext);
-
-  if (isl_ctx_last_error(getIslCtx()) == isl_error_quota) {
-    isl_set_free(BoundaryContext);
-    BoundaryContext = isl_set_empty(getParamSpace());
-  }
-
-  isl_options_set_on_error(getIslCtx(), ISL_ON_ERROR_ABORT);
-  isl_ctx_reset_operations(getIslCtx());
-  isl_ctx_set_max_operations(getIslCtx(), MaxOpsOld);
-  BoundaryContext = isl_set_gist_params(BoundaryContext, getContext());
-  trackAssumption(WRAPPING, BoundaryContext, DebugLoc());
+  auto *WrappingContext = Affinator.getWrappingContext();
+  addAssumption(WRAPPING, WrappingContext, DebugLoc(), AS_RESTRICTION);
 }
 
 void Scop::addUserAssumptions(AssumptionCache &AC, DominatorTree &DT,
@@ -1806,9 +1785,10 @@ void Scop::addUserAssumptions(AssumptionCache &AC, DominatorTree &DT,
     if (!DT.dominates(CI->getParent(), R->getEntry()))
       continue;
 
+    auto *L = LI.getLoopFor(CI->getParent());
     auto *Val = CI->getArgOperand(0);
     std::vector<const SCEV *> Params;
-    if (!isAffineParamConstraint(Val, R, *SE, Params)) {
+    if (!isAffineParamConstraint(Val, R, L, *SE, Params)) {
       emitOptimizationRemarkAnalysis(F.getContext(), DEBUG_TYPE, F,
                                      CI->getDebugLoc(),
                                      "Non-affine user assumption ignored.");
@@ -1817,7 +1797,6 @@ void Scop::addUserAssumptions(AssumptionCache &AC, DominatorTree &DT,
 
     addParams(Params);
 
-    auto *L = LI.getLoopFor(CI->getParent());
     SmallVector<isl_set *, 2> ConditionSets;
     buildConditionSets(*this, Val, nullptr, L, Context, ConditionSets);
     assert(ConditionSets.size() == 2);
@@ -1902,6 +1881,7 @@ void Scop::buildInvariantEquivalenceClasses(ScopDetection &SD) {
 void Scop::buildContext() {
   isl_space *Space = isl_space_params_alloc(getIslCtx(), 0);
   Context = isl_set_universe(isl_space_copy(Space));
+  InvalidContext = isl_set_empty(isl_space_copy(Space));
   AssumedContext = isl_set_universe(Space);
 }
 
@@ -1981,7 +1961,7 @@ void Scop::simplifyContexts() {
   //   otherwise we would access out of bound data. Now, knowing that code is
   //   only executed for the case m >= 0, it is sufficient to assume p >= 0.
   AssumedContext = simplifyAssumptionContext(AssumedContext, *this);
-  BoundaryContext = simplifyAssumptionContext(BoundaryContext, *this);
+  InvalidContext = isl_set_align_params(InvalidContext, getParamSpace());
 }
 
 /// @brief Add the minimal/maximal access in @p Set to @p User.
@@ -2439,8 +2419,8 @@ void Scop::propagateDomainConstraints(Region *R, ScopDetection &SD,
     if (containsErrorBlock(RN, getRegion(), LI, DT)) {
       IsOptimized = true;
       isl_set *DomPar = isl_set_params(isl_set_copy(Domain));
-      addAssumption(ERRORBLOCK, isl_set_complement(DomPar),
-                    BB->getTerminator()->getDebugLoc());
+      addAssumption(ERRORBLOCK, DomPar, BB->getTerminator()->getDebugLoc(),
+                    AS_RESTRICTION);
     }
   }
 }
@@ -2540,9 +2520,8 @@ void Scop::addLoopBoundsToHeaderDomain(Loop *L, LoopInfo &LI) {
   }
 
   isl_set *UnboundedCtx = isl_set_params(Parts.first);
-  isl_set *BoundedCtx = isl_set_complement(UnboundedCtx);
-  addAssumption(INFINITELOOP, BoundedCtx,
-                HeaderBB->getTerminator()->getDebugLoc());
+  addAssumption(INFINITELOOP, UnboundedCtx,
+                HeaderBB->getTerminator()->getDebugLoc(), AS_RESTRICTION);
 }
 
 void Scop::buildAliasChecks(AliasAnalysis &AA) {
@@ -2788,12 +2767,13 @@ static unsigned getMaxLoopDepthInRegion(const Region &R, LoopInfo &LI,
   return MaxLD - MinLD + 1;
 }
 
-Scop::Scop(Region &R, ScalarEvolution &ScalarEvolution, unsigned MaxLoopDepth)
+Scop::Scop(Region &R, ScalarEvolution &ScalarEvolution, LoopInfo &LI,
+           unsigned MaxLoopDepth)
     : SE(&ScalarEvolution), R(R), IsOptimized(false),
       HasSingleExitEdge(R.getExitingBlock()), HasErrorBlock(false),
       MaxLoopDepth(MaxLoopDepth), IslCtx(isl_ctx_alloc(), isl_ctx_free),
-      Context(nullptr), Affinator(this), AssumedContext(nullptr),
-      BoundaryContext(nullptr), Schedule(nullptr) {
+      Context(nullptr), Affinator(this, LI), AssumedContext(nullptr),
+      InvalidContext(nullptr), Schedule(nullptr) {
   isl_options_set_on_error(getIslCtx(), ISL_ON_ERROR_ABORT);
   buildContext();
 }
@@ -2817,25 +2797,26 @@ void Scop::init(AliasAnalysis &AA, AssumptionCache &AC, ScopDetection &SD,
 
   buildSchedule(SD, LI);
 
-  if (isl_set_is_empty(AssumedContext))
+  if (!hasFeasibleRuntimeContext())
     return;
 
   updateAccessDimensionality();
   realignParams();
   addParameterBounds();
   addUserContext();
-  buildBoundaryContext();
+  addWrappingContext();
   simplifyContexts();
   buildAliasChecks(AA);
 
   hoistInvariantLoads(SD);
+  verifyInvariantLoads(SD);
   simplifySCoP(false, DT, LI);
 }
 
 Scop::~Scop() {
   isl_set_free(Context);
   isl_set_free(AssumedContext);
-  isl_set_free(BoundaryContext);
+  isl_set_free(InvalidContext);
   isl_schedule_free(Schedule);
 
   for (auto It : DomainMap)
@@ -2991,11 +2972,29 @@ void Scop::addInvariantLoads(ScopStmt &Stmt, MemoryAccessList &InvMAs) {
       if (PointerSCEV != std::get<0>(IAClass) || Ty != std::get<3>(IAClass))
         continue;
 
-      Consolidated = true;
+      // If the pointer and the type is equal check if the access function wrt.
+      // to the domain is equal too. It can happen that the domain fixes
+      // parameter values and these can be different for distinct part of the
+      // SCoP. If this happens we cannot consolidate the loads but need to
+      // create a new invariant load equivalence class.
+      auto &MAs = std::get<1>(IAClass);
+      if (!MAs.empty()) {
+        auto *LastMA = MAs.front();
+
+        auto *AR = isl_map_range(MA->getAccessRelation());
+        auto *LastAR = isl_map_range(LastMA->getAccessRelation());
+        bool SameAR = isl_set_is_equal(AR, LastAR);
+        isl_set_free(AR);
+        isl_set_free(LastAR);
+
+        if (!SameAR)
+          continue;
+      }
 
       // Add MA to the list of accesses that are in this class.
-      auto &MAs = std::get<1>(IAClass);
       MAs.push_front(MA);
+
+      Consolidated = true;
 
       // Unify the execution context of the class and this statement.
       isl_set *&IAClassDomainCtx = std::get<2>(IAClass);
@@ -3104,30 +3103,29 @@ void Scop::verifyInvariantLoads(ScopDetection &SD) {
 }
 
 void Scop::hoistInvariantLoads(ScopDetection &SD) {
-  if (PollyInvariantLoadHoisting) {
-    isl_union_map *Writes = getWrites();
-    for (ScopStmt &Stmt : *this) {
-      MemoryAccessList InvariantAccesses;
+  if (!PollyInvariantLoadHoisting)
+    return;
 
-      for (MemoryAccess *Access : Stmt)
-        if (isHoistableAccess(Access, Writes))
-          InvariantAccesses.push_front(Access);
+  isl_union_map *Writes = getWrites();
+  for (ScopStmt &Stmt : *this) {
+    MemoryAccessList InvariantAccesses;
 
-      // We inserted invariant accesses always in the front but need them to be
-      // sorted in a "natural order". The statements are already sorted in
-      // reverse post order and that suffices for the accesses too. The reason
-      // we require an order in the first place is the dependences between
-      // invariant loads that can be caused by indirect loads.
-      InvariantAccesses.reverse();
+    for (MemoryAccess *Access : Stmt)
+      if (isHoistableAccess(Access, Writes))
+        InvariantAccesses.push_front(Access);
 
-      // Transfer the memory access from the statement to the SCoP.
-      Stmt.removeMemoryAccesses(InvariantAccesses);
-      addInvariantLoads(Stmt, InvariantAccesses);
-    }
-    isl_union_map_free(Writes);
+    // We inserted invariant accesses always in the front but need them to be
+    // sorted in a "natural order". The statements are already sorted in
+    // reverse post order and that suffices for the accesses too. The reason
+    // we require an order in the first place is the dependences between
+    // invariant loads that can be caused by indirect loads.
+    InvariantAccesses.reverse();
+
+    // Transfer the memory access from the statement to the SCoP.
+    Stmt.removeMemoryAccesses(InvariantAccesses);
+    addInvariantLoads(Stmt, InvariantAccesses);
   }
-
-  verifyInvariantLoads(SD);
+  isl_union_map_free(Writes);
 }
 
 const ScopArrayInfo *
@@ -3159,11 +3157,12 @@ const ScopArrayInfo *Scop::getScopArrayInfo(Value *BasePtr,
 std::string Scop::getContextStr() const { return stringFromIslObj(Context); }
 
 std::string Scop::getAssumedContextStr() const {
+  assert(AssumedContext && "Assumed context not yet built");
   return stringFromIslObj(AssumedContext);
 }
 
-std::string Scop::getBoundaryContextStr() const {
-  return stringFromIslObj(BoundaryContext);
+std::string Scop::getInvalidContextStr() const {
+  return stringFromIslObj(InvalidContext);
 }
 
 std::string Scop::getNameStr() const {
@@ -3189,22 +3188,24 @@ __isl_give isl_space *Scop::getParamSpace() const {
 }
 
 __isl_give isl_set *Scop::getAssumedContext() const {
+  assert(AssumedContext && "Assumed context not yet built");
   return isl_set_copy(AssumedContext);
 }
 
-__isl_give isl_set *Scop::getRuntimeCheckContext() const {
-  isl_set *RuntimeCheckContext = getAssumedContext();
-  RuntimeCheckContext =
-      isl_set_intersect(RuntimeCheckContext, getBoundaryContext());
-  RuntimeCheckContext = simplifyAssumptionContext(RuntimeCheckContext, *this);
-  return RuntimeCheckContext;
-}
-
 bool Scop::hasFeasibleRuntimeContext() const {
-  isl_set *RuntimeCheckContext = getRuntimeCheckContext();
-  RuntimeCheckContext = addNonEmptyDomainConstraints(RuntimeCheckContext);
-  bool IsFeasible = !isl_set_is_empty(RuntimeCheckContext);
-  isl_set_free(RuntimeCheckContext);
+  auto *PositiveContext = getAssumedContext();
+  PositiveContext = addNonEmptyDomainConstraints(PositiveContext);
+  bool IsFeasible = !isl_set_is_empty(PositiveContext);
+  isl_set_free(PositiveContext);
+  if (!IsFeasible)
+    return false;
+
+  auto *NegativeContext = getInvalidContext();
+  auto *DomainContext = isl_union_set_params(getDomains());
+  IsFeasible = !isl_set_is_subset(DomainContext, NegativeContext);
+  isl_set_free(NegativeContext);
+  isl_set_free(DomainContext);
+
   return IsFeasible;
 }
 
@@ -3230,67 +3231,62 @@ static std::string toString(AssumptionKind Kind) {
   llvm_unreachable("Unknown AssumptionKind!");
 }
 
-void Scop::trackAssumption(AssumptionKind Kind, __isl_keep isl_set *Set,
-                           DebugLoc Loc) {
-  if (isl_set_is_subset(Context, Set))
-    return;
+bool Scop::trackAssumption(AssumptionKind Kind, __isl_keep isl_set *Set,
+                           DebugLoc Loc, AssumptionSign Sign) {
+  if (Sign == AS_ASSUMPTION) {
+    if (isl_set_is_subset(Context, Set))
+      return false;
 
-  if (isl_set_is_subset(AssumedContext, Set))
-    return;
+    if (isl_set_is_subset(AssumedContext, Set))
+      return false;
+  } else {
+    if (isl_set_is_disjoint(Set, Context))
+      return false;
+
+    if (isl_set_is_subset(Set, InvalidContext))
+      return false;
+  }
 
   auto &F = *getRegion().getEntry()->getParent();
-  std::string Msg = toString(Kind) + " assumption:\t" + stringFromIslObj(Set);
+  auto Suffix = Sign == AS_ASSUMPTION ? " assumption:\t" : " restriction:\t";
+  std::string Msg = toString(Kind) + Suffix + stringFromIslObj(Set);
   emitOptimizationRemarkAnalysis(F.getContext(), DEBUG_TYPE, F, Loc, Msg);
+  return true;
 }
 
 void Scop::addAssumption(AssumptionKind Kind, __isl_take isl_set *Set,
-                         DebugLoc Loc) {
-  trackAssumption(Kind, Set, Loc);
-  AssumedContext = isl_set_intersect(AssumedContext, Set);
-
-  int NSets = isl_set_n_basic_set(AssumedContext);
-  if (NSets >= MaxDisjunctsAssumed) {
-    isl_space *Space = isl_set_get_space(AssumedContext);
-    isl_set_free(AssumedContext);
-    AssumedContext = isl_set_empty(Space);
+                         DebugLoc Loc, AssumptionSign Sign) {
+  if (!trackAssumption(Kind, Set, Loc, Sign)) {
+    isl_set_free(Set);
+    return;
   }
 
-  AssumedContext = isl_set_coalesce(AssumedContext);
+  if (Sign == AS_ASSUMPTION) {
+    AssumedContext = isl_set_intersect(AssumedContext, Set);
+    AssumedContext = isl_set_coalesce(AssumedContext);
+  } else {
+    InvalidContext = isl_set_union(InvalidContext, Set);
+    InvalidContext = isl_set_coalesce(InvalidContext);
+  }
 }
 
 void Scop::invalidate(AssumptionKind Kind, DebugLoc Loc) {
-  addAssumption(Kind, isl_set_empty(getParamSpace()), Loc);
+  addAssumption(Kind, isl_set_empty(getParamSpace()), Loc, AS_ASSUMPTION);
 }
 
-__isl_give isl_set *Scop::getBoundaryContext() const {
-  return isl_set_copy(BoundaryContext);
+__isl_give isl_set *Scop::getInvalidContext() const {
+  return isl_set_copy(InvalidContext);
 }
 
 void Scop::printContext(raw_ostream &OS) const {
   OS << "Context:\n";
-
-  if (!Context) {
-    OS.indent(4) << "n/a\n\n";
-    return;
-  }
-
-  OS.indent(4) << getContextStr() << "\n";
+  OS.indent(4) << Context << "\n";
 
   OS.indent(4) << "Assumed Context:\n";
-  if (!AssumedContext) {
-    OS.indent(4) << "n/a\n\n";
-    return;
-  }
+  OS.indent(4) << AssumedContext << "\n";
 
-  OS.indent(4) << getAssumedContextStr() << "\n";
-
-  OS.indent(4) << "Boundary Context:\n";
-  if (!BoundaryContext) {
-    OS.indent(4) << "n/a\n\n";
-    return;
-  }
-
-  OS.indent(4) << getBoundaryContextStr() << "\n";
+  OS.indent(4) << "Invalid Context:\n";
+  OS.indent(4) << InvalidContext << "\n";
 
   for (const SCEV *Parameter : Parameters) {
     int Dim = ParameterIds.find(Parameter)->second;
@@ -3766,7 +3762,8 @@ void ScopInfo::buildPHIAccesses(PHINode *PHI, Region &R,
   // If we can synthesize a PHI we can skip it, however only if it is in
   // the region. If it is not it can only be in the exit block of the region.
   // In this case we model the operands but not the PHI itself.
-  if (!IsExitBlock && canSynthesize(PHI, LI, SE, &R))
+  auto *Scope = LI->getLoopFor(PHI->getParent());
+  if (!IsExitBlock && canSynthesize(PHI, LI, SE, &R, Scope))
     return;
 
   // PHI nodes are modeled as if they had been demoted prior to the SCoP
@@ -3861,7 +3858,7 @@ bool ScopInfo::buildAccessMultiDimFixed(
 
   for (auto *Subscript : Subscripts) {
     InvariantLoadsSetTy AccessILS;
-    if (!isAffineExpr(R, Subscript, *SE, nullptr, &AccessILS))
+    if (!isAffineExpr(R, L, Subscript, *SE, nullptr, &AccessILS))
       return false;
 
     for (LoadInst *LInst : AccessILS)
@@ -3940,7 +3937,7 @@ bool ScopInfo::buildAccessMemIntrinsic(
 
   // Check if the length val is actually affine or if we overapproximate it
   InvariantLoadsSetTy AccessILS;
-  bool LengthIsAffine = isAffineExpr(R, LengthVal, *SE, nullptr, &AccessILS);
+  bool LengthIsAffine = isAffineExpr(R, L, LengthVal, *SE, nullptr, &AccessILS);
   for (LoadInst *LInst : AccessILS)
     if (!ScopRIL.count(LInst))
       LengthIsAffine = false;
@@ -4050,9 +4047,9 @@ void ScopInfo::buildAccessSingleDim(
   }
 
   InvariantLoadsSetTy AccessILS;
-  bool IsAffine =
-      !isVariantInNonAffineLoop &&
-      isAffineExpr(R, AccessFunction, *SE, BasePointer->getValue(), &AccessILS);
+  bool IsAffine = !isVariantInNonAffineLoop &&
+                  isAffineExpr(R, L, AccessFunction, *SE,
+                               BasePointer->getValue(), &AccessILS);
 
   for (LoadInst *LInst : AccessILS)
     if (!ScopRIL.count(LInst))
@@ -4244,7 +4241,8 @@ void ScopInfo::ensureValueRead(Value *V, BasicBlock *UserBB) {
   // If the instruction can be synthesized and the user is in the region we do
   // not need to add a value dependences.
   Region &ScopRegion = scop->getRegion();
-  if (canSynthesize(V, LI, SE, &ScopRegion))
+  auto *Scope = LI->getLoopFor(UserBB);
+  if (canSynthesize(V, LI, SE, &ScopRegion, Scope))
     return;
 
   // Do not build scalar dependences for required invariant loads as we will
@@ -4322,7 +4320,7 @@ void ScopInfo::addPHIReadAccess(PHINode *PHI) {
 
 void ScopInfo::buildScop(Region &R, AssumptionCache &AC) {
   unsigned MaxLoopDepth = getMaxLoopDepthInRegion(R, *LI, *SD);
-  scop.reset(new Scop(R, *SE, MaxLoopDepth));
+  scop.reset(new Scop(R, *SE, *LI, MaxLoopDepth));
 
   buildStmts(R, R);
   buildAccessFunctions(R, R, *SD->getInsnToMemAccMap(&R));
