@@ -132,6 +132,12 @@ static cl::opt<bool>
                    cl::Hidden, cl::init(false), cl::ZeroOrMore,
                    cl::cat(PollyCategory));
 
+static cl::opt<bool>
+    AllowModrefCall("polly-allow-modref-calls",
+                    cl::desc("Allow functions with known modref behavior"),
+                    cl::Hidden, cl::init(false), cl::ZeroOrMore,
+                    cl::cat(PollyCategory));
+
 static cl::opt<bool> AllowNonAffineSubRegions(
     "polly-allow-nonaffine-branches",
     cl::desc("Allow non affine conditions for branches"), cl::Hidden,
@@ -470,39 +476,41 @@ bool ScopDetection::isValidCallInst(CallInst &CI,
   if (CalledFunction == 0)
     return false;
 
-  switch (AA->getModRefBehavior(CalledFunction)) {
-  case llvm::FMRB_UnknownModRefBehavior:
-    return false;
-  case llvm::FMRB_DoesNotAccessMemory:
-  case llvm::FMRB_OnlyReadsMemory:
-    // Implicitly disable delinearization since we have an unknown
-    // accesses with an unknown access function.
-    Context.HasUnknownAccess = true;
-    Context.AST.add(&CI);
-    return true;
-  case llvm::FMRB_OnlyReadsArgumentPointees:
-  case llvm::FMRB_OnlyAccessesArgumentPointees:
-    for (const auto &Arg : CI.arg_operands()) {
-      if (!Arg->getType()->isPointerTy())
-        continue;
-
-      // Bail if a pointer argument has a base address not known to
-      // ScalarEvolution. Note that a zero pointer is acceptable.
-      auto *ArgSCEV = SE->getSCEVAtScope(Arg, LI->getLoopFor(CI.getParent()));
-      if (ArgSCEV->isZero())
-        continue;
-
-      auto *BP = dyn_cast<SCEVUnknown>(SE->getPointerBase(ArgSCEV));
-      if (!BP)
-        return false;
-
+  if (AllowModrefCall) {
+    switch (AA->getModRefBehavior(CalledFunction)) {
+    case llvm::FMRB_UnknownModRefBehavior:
+      return false;
+    case llvm::FMRB_DoesNotAccessMemory:
+    case llvm::FMRB_OnlyReadsMemory:
       // Implicitly disable delinearization since we have an unknown
       // accesses with an unknown access function.
       Context.HasUnknownAccess = true;
-    }
+      Context.AST.add(&CI);
+      return true;
+    case llvm::FMRB_OnlyReadsArgumentPointees:
+    case llvm::FMRB_OnlyAccessesArgumentPointees:
+      for (const auto &Arg : CI.arg_operands()) {
+        if (!Arg->getType()->isPointerTy())
+          continue;
 
-    Context.AST.add(&CI);
-    return true;
+        // Bail if a pointer argument has a base address not known to
+        // ScalarEvolution. Note that a zero pointer is acceptable.
+        auto *ArgSCEV = SE->getSCEVAtScope(Arg, LI->getLoopFor(CI.getParent()));
+        if (ArgSCEV->isZero())
+          continue;
+
+        auto *BP = dyn_cast<SCEVUnknown>(SE->getPointerBase(ArgSCEV));
+        if (!BP)
+          return false;
+
+        // Implicitly disable delinearization since we have an unknown
+        // accesses with an unknown access function.
+        Context.HasUnknownAccess = true;
+      }
+
+      Context.AST.add(&CI);
+      return true;
+    }
   }
 
   return false;
@@ -525,17 +533,21 @@ bool ScopDetection::isValidIntrinsicInst(IntrinsicInst &II,
   case llvm::Intrinsic::memmove:
   case llvm::Intrinsic::memcpy:
     AF = SE->getSCEVAtScope(cast<MemTransferInst>(II).getSource(), L);
-    BP = dyn_cast<SCEVUnknown>(SE->getPointerBase(AF));
-    // Bail if the source pointer is not valid.
-    if (!isValidAccess(&II, AF, BP, Context))
-      return false;
+    if (!AF->isZero()) {
+      BP = dyn_cast<SCEVUnknown>(SE->getPointerBase(AF));
+      // Bail if the source pointer is not valid.
+      if (!isValidAccess(&II, AF, BP, Context))
+        return false;
+    }
   // Fall through
   case llvm::Intrinsic::memset:
     AF = SE->getSCEVAtScope(cast<MemIntrinsic>(II).getDest(), L);
-    BP = dyn_cast<SCEVUnknown>(SE->getPointerBase(AF));
-    // Bail if the destination pointer is not valid.
-    if (!isValidAccess(&II, AF, BP, Context))
-      return false;
+    if (!AF->isZero()) {
+      BP = dyn_cast<SCEVUnknown>(SE->getPointerBase(AF));
+      // Bail if the destination pointer is not valid.
+      if (!isValidAccess(&II, AF, BP, Context))
+        return false;
+    }
 
     // Bail if the length is not affine.
     if (!isAffine(SE->getSCEVAtScope(cast<MemIntrinsic>(II).getLength(), L), L,
@@ -567,8 +579,7 @@ bool ScopDetection::isInvariant(const Value &Val, const Region &Reg) const {
 
   // When Val is a Phi node, it is likely not invariant. We do not check whether
   // Phi nodes are actually invariant, we assume that Phi nodes are usually not
-  // invariant. Recursively checking the operators of Phi nodes would lead to
-  // infinite recursion.
+  // invariant.
   if (isa<PHINode>(*I))
     return false;
 

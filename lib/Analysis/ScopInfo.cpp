@@ -99,12 +99,6 @@ static cl::opt<bool> DetectReductions("polly-detect-reductions",
                                       cl::Hidden, cl::ZeroOrMore,
                                       cl::init(true), cl::cat(PollyCategory));
 
-static cl::opt<int> MaxDisjunctsAssumed(
-    "polly-max-disjuncts-assumed",
-    cl::desc("The maximal number of disjuncts we allow in the assumption "
-             "context (this bounds compile time)"),
-    cl::Hidden, cl::ZeroOrMore, cl::init(150), cl::cat(PollyCategory));
-
 static cl::opt<bool> IgnoreIntegerWrapping(
     "polly-ignore-integer-wrapping",
     cl::desc("Do not build run-time checks to proof absence of integer "
@@ -2101,7 +2095,6 @@ static bool containsErrorBlock(RegionNode *RN, const Region &R, LoopInfo &LI,
 
 static inline __isl_give isl_set *addDomainDimId(__isl_take isl_set *Domain,
                                                  unsigned Dim, Loop *L) {
-  Domain = isl_set_lower_bound_si(Domain, isl_dim_set, Dim, -1);
   isl_id *DimId =
       isl_id_alloc(isl_set_get_ctx(Domain), nullptr, static_cast<void *>(L));
   return isl_set_set_dim_id(Domain, isl_dim_set, Dim, DimId);
@@ -2284,6 +2277,11 @@ void Scop::buildDomainsWithBranchConstraints(Region *R, ScopDetection &SD,
       // case there are multiple paths (without loop back edges) to the
       // successor block.
       isl_set *&SuccDomain = DomainMap[SuccBB];
+
+      if (HasComplexCFG) {
+        isl_set_free(CondSet);
+        continue;
+      }
       if (!SuccDomain)
         SuccDomain = CondSet;
       else
@@ -2294,6 +2292,7 @@ void Scop::buildDomainsWithBranchConstraints(Region *R, ScopDetection &SD,
         auto *Empty = isl_set_empty(isl_set_get_space(SuccDomain));
         isl_set_free(SuccDomain);
         SuccDomain = Empty;
+        HasComplexCFG = true;
         invalidate(ERROR_DOMAINCONJUNCTS, DebugLoc());
       }
     }
@@ -2360,7 +2359,6 @@ void Scop::propagateDomainConstraints(Region *R, ScopDetection &SD,
     }
 
     Loop *BBLoop = getRegionNodeLoop(RN, LI);
-    int BBLoopDepth = getRelativeLoopDepth(BBLoop);
 
     isl_set *PredDom = isl_set_empty(isl_set_get_space(Domain));
     for (auto *PredBB : predecessors(BB)) {
@@ -2377,32 +2375,30 @@ void Scop::propagateDomainConstraints(Region *R, ScopDetection &SD,
 
       if (!PredBBDom) {
         // Determine the loop depth of the predecessor and adjust its domain to
-        // the domain of the current block. This can mean we have to:
-        //  o) Drop a dimension if this block is the exit of a loop, not the
-        //     header of a new loop and the predecessor was part of the loop.
-        //  o) Add an unconstrainted new dimension if this block is the header
-        //     of a loop and the predecessor is not part of it.
-        //  o) Drop the information about the innermost loop dimension when the
-        //     predecessor and the current block are surrounded by different
-        //     loops in the same depth.
+        // the domain of the current block. This means we have to:
+        //  o) Drop all loop dimension of loops we are leaving.
+        //  o) Add a dimension for each loop we are entering.
         PredBBDom = getDomainForBlock(PredBB, DomainMap, *R->getRegionInfo());
         Loop *PredBBLoop = LI.getLoopFor(PredBB);
         while (BoxedLoops.count(PredBBLoop))
           PredBBLoop = PredBBLoop->getParentLoop();
 
-        int PredBBLoopDepth = getRelativeLoopDepth(PredBBLoop);
-        unsigned LoopDepthDiff = std::abs(BBLoopDepth - PredBBLoopDepth);
-        if (BBLoopDepth < PredBBLoopDepth)
-          PredBBDom = isl_set_project_out(
-              PredBBDom, isl_dim_set, isl_set_n_dim(PredBBDom) - LoopDepthDiff,
-              LoopDepthDiff);
-        else if (PredBBLoopDepth < BBLoopDepth) {
-          assert(LoopDepthDiff == 1);
-          PredBBDom = isl_set_add_dims(PredBBDom, isl_dim_set, 1);
-        } else if (BBLoop != PredBBLoop && BBLoopDepth >= 0) {
-          assert(LoopDepthDiff <= 1);
-          PredBBDom = isl_set_drop_constraints_involving_dims(
-              PredBBDom, isl_dim_set, BBLoopDepth, 1);
+        Loop *LeaveL = PredBBLoop;
+        while (getRegion().contains(LeaveL) &&
+               (!BBLoop || !LeaveL->contains(BBLoop))) {
+          PredBBDom = isl_set_project_out(PredBBDom, isl_dim_set,
+                                          isl_set_n_dim(PredBBDom) - 1, 1);
+          LeaveL = LeaveL->getParentLoop();
+        }
+        unsigned CommonDepth = isl_set_n_dim(PredBBDom);
+
+        Loop *EnterL = BBLoop;
+        while (getRegion().contains(EnterL) &&
+               (!PredBBLoop || !EnterL->contains(PredBBLoop))) {
+          PredBBDom =
+              isl_set_insert_dims(PredBBDom, isl_dim_set, CommonDepth, 1);
+          PredBBDom = addDomainDimId(PredBBDom, CommonDepth, EnterL);
+          EnterL = EnterL->getParentLoop();
         }
       }
 
@@ -2771,9 +2767,10 @@ Scop::Scop(Region &R, ScalarEvolution &ScalarEvolution, LoopInfo &LI,
            unsigned MaxLoopDepth)
     : SE(&ScalarEvolution), R(R), IsOptimized(false),
       HasSingleExitEdge(R.getExitingBlock()), HasErrorBlock(false),
-      MaxLoopDepth(MaxLoopDepth), IslCtx(isl_ctx_alloc(), isl_ctx_free),
-      Context(nullptr), Affinator(this, LI), AssumedContext(nullptr),
-      InvalidContext(nullptr), Schedule(nullptr) {
+      HasComplexCFG(false), MaxLoopDepth(MaxLoopDepth),
+      IslCtx(isl_ctx_alloc(), isl_ctx_free), Context(nullptr),
+      Affinator(this, LI), AssumedContext(nullptr), InvalidContext(nullptr),
+      Schedule(nullptr) {
   isl_options_set_on_error(getIslCtx(), ISL_ON_ERROR_ABORT);
   buildContext();
 }
@@ -2920,9 +2917,15 @@ const InvariantEquivClassTy *Scop::lookupInvariantEquivClass(Value *Val) const {
 
   Type *Ty = LInst->getType();
   const SCEV *PointerSCEV = SE->getSCEV(LInst->getPointerOperand());
-  for (auto &IAClass : InvariantEquivClasses)
-    if (PointerSCEV == std::get<0>(IAClass) && Ty == std::get<3>(IAClass))
-      return &IAClass;
+  for (auto &IAClass : InvariantEquivClasses) {
+    if (PointerSCEV != std::get<0>(IAClass) || Ty != std::get<3>(IAClass))
+      continue;
+
+    auto &MAs = std::get<1>(IAClass);
+    for (auto *MA : MAs)
+      if (MA->getAccessInstruction() == Val)
+        return &IAClass;
+  }
 
   return nullptr;
 }
@@ -3061,14 +3064,7 @@ bool Scop::isHoistableAccess(MemoryAccess *Access,
     return false;
 
   isl_map *AccessRelation = Access->getAccessRelation();
-
-  // Skip accesses that have an empty access relation. These can be caused
-  // by multiple offsets with a type cast in-between that cause the overall
-  // byte offset to be not divisible by the new types sizes.
-  if (isl_map_is_empty(AccessRelation)) {
-    isl_map_free(AccessRelation);
-    return false;
-  }
+  assert(!isl_map_is_empty(AccessRelation));
 
   if (isl_map_involves_dims(AccessRelation, isl_dim_in, 0,
                             Stmt.getNumIterators())) {
@@ -3946,8 +3942,17 @@ bool ScopInfo::buildAccessMemIntrinsic(
 
   auto *DestPtrVal = MemIntr->getDest();
   assert(DestPtrVal);
+
   auto *DestAccFunc = SE->getSCEVAtScope(DestPtrVal, L);
   assert(DestAccFunc);
+  // Ignore accesses to "NULL".
+  // TODO: We could use this to optimize the region further, e.g., intersect
+  //       the context with
+  //          isl_set_complement(isl_set_params(getDomain()))
+  //       as we know it would be undefined to execute this instruction anyway.
+  if (DestAccFunc->isZero())
+    return true;
+
   auto *DestPtrSCEV = dyn_cast<SCEVUnknown>(SE->getPointerBase(DestAccFunc));
   assert(DestPtrSCEV);
   DestAccFunc = SE->getMinusSCEV(DestAccFunc, DestPtrSCEV);
@@ -3961,8 +3966,14 @@ bool ScopInfo::buildAccessMemIntrinsic(
 
   auto *SrcPtrVal = MemTrans->getSource();
   assert(SrcPtrVal);
+
   auto *SrcAccFunc = SE->getSCEVAtScope(SrcPtrVal, L);
   assert(SrcAccFunc);
+  // Ignore accesses to "NULL".
+  // TODO: See above TODO
+  if (SrcAccFunc->isZero())
+    return true;
+
   auto *SrcPtrSCEV = dyn_cast<SCEVUnknown>(SE->getPointerBase(SrcAccFunc));
   assert(SrcPtrSCEV);
   SrcAccFunc = SE->getMinusSCEV(SrcAccFunc, SrcPtrSCEV);
