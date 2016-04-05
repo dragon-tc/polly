@@ -50,14 +50,14 @@
 
 ; AST:      if (1)
 ;
-; AST:          for (int c0 = 1; c0 < N; c0 += 4) {
-; AST-NEXT:       Stmt_sw_bb_1(c0);
-; AST-NEXT:       if (N >= c0 + 2) {
-; AST-NEXT:         Stmt_sw_bb_2(c0 + 1);
-; AST-NEXT:         if (N >= c0 + 3)
-; AST-NEXT:           Stmt_sw_bb_6(c0 + 2);
-; AST-NEXT:       }
-; AST-NEXT:     }
+; AST:         for (int c0 = 1; c0 < N; c0 += 4) {
+; AST-NEXT:      Stmt_sw_bb_1(c0);
+; AST-NEXT:      if (N >= c0 + 2) {
+; AST-NEXT:        Stmt_sw_bb_2(c0 + 1);
+; AST-NEXT:        if (N >= c0 + 3)
+; AST-NEXT:          Stmt_sw_bb_6(c0 + 2);
+; AST-NEXT:      }
+; AST-NEXT:    }
 ;
 ; AST:      else
 ; AST-NEXT:     {  /* original code */ }

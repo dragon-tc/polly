@@ -216,7 +216,8 @@ public:
   }
 };
 
-int DiagnosticScopFound::PluginDiagnosticKind = 10;
+int DiagnosticScopFound::PluginDiagnosticKind =
+    getNextAvailablePluginDiagnosticKind();
 
 void DiagnosticScopFound::print(DiagnosticPrinter &DP) const {
   DP << "Polly detected an optimizable loop region (scop) in function '" << F
@@ -1028,8 +1029,14 @@ bool ScopDetection::canUseISLTripCount(Loop *L,
   // Ensure the loop has valid exiting blocks as well as latches, otherwise we
   // need to overapproximate it as a boxed loop.
   SmallVector<BasicBlock *, 4> LoopControlBlocks;
-  L->getLoopLatches(LoopControlBlocks);
   L->getExitingBlocks(LoopControlBlocks);
+
+  // Loops without exiting blocks cannot be handled by the schedule generation
+  // as it depends on a region covering that is not given.
+  if (LoopControlBlocks.empty())
+    return false;
+
+  L->getLoopLatches(LoopControlBlocks);
   for (BasicBlock *ControlBB : LoopControlBlocks) {
     if (!isValidCFG(*ControlBB, true, false, Context))
       return false;

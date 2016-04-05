@@ -40,14 +40,14 @@
 
 ; AST:      if (1)
 ;
-; AST:          {
-; AST-NEXT:       for (int c0 = 0; c0 < N - 2; c0 += 4) {
-; AST-NEXT:         Stmt_sw_bb(c0);
-; AST-NEXT:         Stmt_sw_bb_2(c0 + 2);
-; AST-NEXT:       }
-; AST-NEXT:       if (N >= 1 && (N + 1) % 4 >= 2)
-; AST-NEXT:         Stmt_sw_bb(-((N + 1) % 4) + N + 1);
-; AST-NEXT:     }
+; AST:         {
+; AST-NEXT:      for (int c0 = 0; c0 < N - 2; c0 += 4) {
+; AST-NEXT:        Stmt_sw_bb(c0);
+; AST-NEXT:        Stmt_sw_bb_2(c0 + 2);
+; AST-NEXT:      }
+; AST-NEXT:      if (N >= 1 && (N + 1) % 4 >= 2)
+; AST-NEXT:        Stmt_sw_bb(-((N + 1) % 4) + N + 1);
+; AST-NEXT:    }
 ;
 ; AST:      else
 ; AST-NEXT:     {  /* original code */ }
