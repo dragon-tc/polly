@@ -80,7 +80,7 @@ static cl::opt<int> ProfitabilityMinPerLoopInstructions(
     "polly-detect-profitability-min-per-loop-insts",
     cl::desc("The minimal number of per-loop instructions before a single loop "
              "region is considered profitable"),
-    cl::Hidden, cl::ValueRequired, cl::init(100000000), cl::cat(PollyCategory));
+    cl::Hidden, cl::ValueRequired, cl::init(30), cl::cat(PollyCategory));
 
 bool polly::PollyProcessUnprofitable;
 static cl::opt<bool, true> XPollyProcessUnprofitable(
