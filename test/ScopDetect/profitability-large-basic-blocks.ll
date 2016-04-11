@@ -1,4 +1,5 @@
 ; RUN: opt %loadPolly -polly-process-unprofitable=false \
+; RUN:                -polly-use-per-loop-inst-profitablility=true \
 ; RUN:                -polly-detect-profitability-min-per-loop-insts=40 \
 ; RUN: -polly-detect -analyze < %s | FileCheck %s -check-prefix=PROFITABLE
 
