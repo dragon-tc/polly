@@ -243,7 +243,9 @@ int ScopArrayInfo::getElemSizeInBytes() const {
   return DL.getTypeAllocSize(ElementType);
 }
 
-isl_id *ScopArrayInfo::getBasePtrId() const { return isl_id_copy(Id); }
+__isl_give isl_id *ScopArrayInfo::getBasePtrId() const {
+  return isl_id_copy(Id);
+}
 
 void ScopArrayInfo::dump() const { print(errs()); }
 
@@ -942,7 +944,7 @@ void MemoryAccess::setNewAccessRelation(isl_map *NewAccess) {
 
 //===----------------------------------------------------------------------===//
 
-isl_map *ScopStmt::getSchedule() const {
+__isl_give isl_map *ScopStmt::getSchedule() const {
   isl_set *Domain = getDomain();
   if (isl_set_is_empty(Domain)) {
     isl_set_free(Domain);
@@ -1763,7 +1765,7 @@ __isl_give isl_id *Scop::getIdForParam(const SCEV *Parameter) {
                       const_cast<void *>((const void *)Parameter));
 }
 
-isl_set *Scop::addNonEmptyDomainConstraints(isl_set *C) const {
+__isl_give isl_set *Scop::addNonEmptyDomainConstraints(isl_set *C) const {
   isl_set *DomainContext = isl_union_set_params(getDomains());
   return isl_set_intersect_params(C, DomainContext);
 }
@@ -2109,46 +2111,20 @@ static inline __isl_give isl_set *addDomainDimId(__isl_take isl_set *Domain,
   return isl_set_set_dim_id(Domain, isl_dim_set, Dim, DimId);
 }
 
-isl_set *Scop::getDomainConditions(ScopStmt *Stmt) {
+__isl_give isl_set *Scop::getDomainConditions(ScopStmt *Stmt) {
   return getDomainConditions(Stmt->getEntryBlock());
 }
 
-isl_set *Scop::getDomainConditions(BasicBlock *BB) {
-  assert(DomainMap.count(BB) && "Requested BB did not have a domain");
-  return isl_set_copy(DomainMap[BB]);
-}
+__isl_give isl_set *Scop::getDomainConditions(BasicBlock *BB) {
+  auto DIt = DomainMap.find(BB);
+  if (DIt != DomainMap.end())
+    return isl_set_copy(DIt->getSecond());
 
-void Scop::removeErrorBlockDomains(ScopDetection &SD, DominatorTree &DT,
-                                   LoopInfo &LI) {
-  auto removeDomains = [this, &DT](BasicBlock *Start) {
-    auto *BBNode = DT.getNode(Start);
-    for (auto *ErrorChild : depth_first(BBNode)) {
-      auto *ErrorChildBlock = ErrorChild->getBlock();
-      auto *CurrentDomain = DomainMap[ErrorChildBlock];
-      auto *Empty = isl_set_empty(isl_set_get_space(CurrentDomain));
-      DomainMap[ErrorChildBlock] = Empty;
-      isl_set_free(CurrentDomain);
-    }
-  };
-
-  SmallVector<Region *, 4> Todo = {&R};
-
-  while (!Todo.empty()) {
-    auto *SubRegion = Todo.back();
-    Todo.pop_back();
-
-    if (!SD.isNonAffineSubRegion(SubRegion, &getRegion())) {
-      for (auto &Child : *SubRegion)
-        Todo.push_back(Child.get());
-      continue;
-    }
-    if (containsErrorBlock(SubRegion->getNode(), getRegion(), LI, DT))
-      removeDomains(SubRegion->getEntry());
-  }
-
-  for (auto *BB : R.blocks())
-    if (isErrorBlock(*BB, R, LI, DT))
-      removeDomains(BB);
+  auto &RI = *R.getRegionInfo();
+  auto *BBR = RI.getRegionFor(BB);
+  while (BBR->getEntry() == BB)
+    BBR = BBR->getParent();
+  return getDomainConditions(BBR->getEntry());
 }
 
 bool Scop::buildDomains(Region *R, ScopDetection &SD, DominatorTree &DT,
@@ -2178,12 +2154,17 @@ bool Scop::buildDomains(Region *R, ScopDetection &SD, DominatorTree &DT,
   // Error blocks and blocks dominated by them have been assumed to never be
   // executed. Representing them in the Scop does not add any value. In fact,
   // it is likely to cause issues during construction of the ScopStmts. The
-  // contents of error blocks have not been verfied to be expressible and
+  // contents of error blocks have not been verified to be expressible and
   // will cause problems when building up a ScopStmt for them.
   // Furthermore, basic blocks dominated by error blocks may reference
   // instructions in the error block which, if the error block is not modeled,
-  // can themselves not be constructed properly.
-  removeErrorBlockDomains(SD, DT, LI);
+  // can themselves not be constructed properly. To this end we will replace
+  // the domains of error blocks and those only reachable via error blocks
+  // with an empty set. Additionally, we will record for each block under which
+  // parameter combination it would be reached via an error block in the
+  // ErrorDomainCtxMap map. This information is needed during load hoisting.
+  propagateErrorConstraints(R, SD, DT, LI);
+
   return true;
 }
 
@@ -2244,6 +2225,65 @@ static __isl_give isl_set *adjustDomainDimensions(Scop &S,
   }
 
   return Dom;
+}
+
+void Scop::propagateErrorConstraints(Region *R, ScopDetection &SD,
+                                     DominatorTree &DT, LoopInfo &LI) {
+
+  ReversePostOrderTraversal<Region *> RTraversal(R);
+  for (auto *RN : RTraversal) {
+
+    // Recurse for affine subregions but go on for basic blocks and non-affine
+    // subregions.
+    if (RN->isSubRegion()) {
+      Region *SubRegion = RN->getNodeAs<Region>();
+      if (!SD.isNonAffineSubRegion(SubRegion, &getRegion())) {
+        propagateErrorConstraints(SubRegion, SD, DT, LI);
+        continue;
+      }
+    }
+
+    bool ContainsErrorBlock = containsErrorBlock(RN, getRegion(), LI, DT);
+    BasicBlock *BB = getRegionNodeBasicBlock(RN);
+    isl_set *&Domain = DomainMap[BB];
+    assert(Domain && "Cannot propagate a nullptr");
+
+    auto *&ErrorCtx = ErrorDomainCtxMap[BB];
+    auto *DomainCtx = isl_set_params(isl_set_copy(Domain));
+    bool IsErrorBlock = ContainsErrorBlock ||
+                        (ErrorCtx && isl_set_is_subset(DomainCtx, ErrorCtx));
+
+    if (IsErrorBlock) {
+      ErrorCtx = ErrorCtx ? isl_set_union(ErrorCtx, DomainCtx) : DomainCtx;
+      auto *EmptyDom = isl_set_empty(isl_set_get_space(Domain));
+      isl_set_free(Domain);
+      Domain = EmptyDom;
+    } else {
+      isl_set_free(DomainCtx);
+    }
+
+    if (!ErrorCtx)
+      continue;
+
+    auto *TI = BB->getTerminator();
+    unsigned NumSuccs = RN->isSubRegion() ? 1 : TI->getNumSuccessors();
+    for (unsigned u = 0; u < NumSuccs; u++) {
+      auto *SuccBB = getRegionNodeSuccessor(RN, TI, u);
+      auto *&SuccErrorCtx = ErrorDomainCtxMap[SuccBB];
+      auto *CurErrorCtx = isl_set_copy(ErrorCtx);
+      SuccErrorCtx =
+          SuccErrorCtx ? isl_set_union(SuccErrorCtx, CurErrorCtx) : CurErrorCtx;
+      SuccErrorCtx = isl_set_coalesce(SuccErrorCtx);
+
+      // Check if the maximal number of domain conjuncts was reached.
+      // In case this happens we will bail.
+      if (isl_set_n_basic_set(SuccErrorCtx) < MaxConjunctsInDomain)
+        continue;
+
+      invalidate(COMPLEXITY, TI->getDebugLoc());
+      return;
+    }
+  }
 }
 
 void Scop::propagateDomainConstraintsToRegionExit(
@@ -2411,28 +2451,11 @@ bool Scop::buildDomainsWithBranchConstraints(Region *R, ScopDetection &SD,
   return true;
 }
 
-/// @brief Return the domain for @p BB wrt @p DomainMap.
-///
-/// This helper function will lookup @p BB in @p DomainMap but also handle the
-/// case where @p BB is contained in a non-affine subregion using the region
-/// tree obtained by @p RI.
-static __isl_give isl_set *
-getDomainForBlock(BasicBlock *BB, DenseMap<BasicBlock *, isl_set *> &DomainMap,
-                  RegionInfo &RI) {
-  auto DIt = DomainMap.find(BB);
-  if (DIt != DomainMap.end())
-    return isl_set_copy(DIt->getSecond());
-
-  Region *R = RI.getRegionFor(BB);
-  while (R->getEntry() == BB)
-    R = R->getParent();
-  return getDomainForBlock(R->getEntry(), DomainMap, RI);
-}
-
-isl_set *Scop::getPredecessorDomainConstraints(BasicBlock *BB, isl_set *Domain,
-                                               ScopDetection &SD,
-                                               DominatorTree &DT,
-                                               LoopInfo &LI) {
+__isl_give isl_set *Scop::getPredecessorDomainConstraints(BasicBlock *BB,
+                                                          isl_set *Domain,
+                                                          ScopDetection &SD,
+                                                          DominatorTree &DT,
+                                                          LoopInfo &LI) {
   // If @p BB is the ScopEntry we are done
   if (R.getEntry() == BB)
     return isl_set_universe(isl_set_get_space(Domain));
@@ -2478,7 +2501,7 @@ isl_set *Scop::getPredecessorDomainConstraints(BasicBlock *BB, isl_set *Domain,
       PropagatedRegions.insert(PredR);
     }
 
-    auto *PredBBDom = getDomainForBlock(PredBB, DomainMap, RI);
+    auto *PredBBDom = getDomainConditions(PredBB);
     auto *PredBBLoop = getFirstNonBoxedLoopFor(PredBB, LI, BoxedLoops);
     PredBBDom = adjustDomainDimensions(*this, PredBBDom, PredBBLoop, BBLoop);
 
@@ -2512,19 +2535,9 @@ void Scop::propagateDomainConstraints(Region *R, ScopDetection &SD,
       }
     }
 
-    // Get the domain for the current block and check if it was initialized or
-    // not. The only way it was not is if this block is only reachable via error
-    // blocks, thus will not be executed under the assumptions we make. Such
-    // blocks have to be skipped as their predecessors might not have domains
-    // either. It would not benefit us to compute the domain anyway, only the
-    // domains of the error blocks that are reachable from non-error blocks
-    // are needed to generate assumptions.
     BasicBlock *BB = getRegionNodeBasicBlock(RN);
     isl_set *&Domain = DomainMap[BB];
-    if (!Domain) {
-      DomainMap.erase(BB);
-      continue;
-    }
+    assert(Domain);
 
     // Under the union of all predecessor conditions we can reach this block.
     auto *PredDom = getPredecessorDomainConstraints(BB, Domain, SD, DT, LI);
@@ -2942,6 +2955,8 @@ Scop::~Scop() {
 
   for (auto It : DomainMap)
     isl_set_free(It.second);
+  for (auto It : ErrorDomainCtxMap)
+    isl_set_free(It.second);
 
   // Free the alias groups
   for (MinMaxVectorPairTy &MinMaxAccessPair : MinMaxAliasGroups) {
@@ -3054,10 +3069,18 @@ const InvariantEquivClassTy *Scop::lookupInvariantEquivClass(Value *Val) const {
   return nullptr;
 }
 
+__isl_give isl_set *Scop::getErrorCtxReachingStmt(ScopStmt &Stmt) {
+  auto *BB = Stmt.getEntryBlock();
+  return isl_set_copy(ErrorDomainCtxMap.lookup(BB));
+}
+
 void Scop::addInvariantLoads(ScopStmt &Stmt, MemoryAccessList &InvMAs) {
 
-  // Get the context under which the statement is executed.
+  // Get the context under which the statement is executed but remove the error
+  // context under which this statement is reached.
   isl_set *DomainCtx = isl_set_params(Stmt.getDomain());
+  if (auto *ErrorCtx = getErrorCtxReachingStmt(Stmt))
+    DomainCtx = isl_set_subtract(DomainCtx, ErrorCtx);
   DomainCtx = isl_set_remove_redundancies(DomainCtx);
   DomainCtx = isl_set_detect_equalities(DomainCtx);
   DomainCtx = isl_set_coalesce(DomainCtx);
@@ -3073,7 +3096,7 @@ void Scop::addInvariantLoads(ScopStmt &Stmt, MemoryAccessList &InvMAs) {
       SetVector<Value *> Values;
       for (const SCEV *Parameter : Parameters) {
         Values.clear();
-        findValues(Parameter, Values);
+        findValues(Parameter, *SE, Values);
         if (!Values.count(AccInst))
           continue;
 
@@ -3965,14 +3988,21 @@ bool ScopInfo::buildAccessMultiDimFixed(
   const SCEV *AccessFunction = SE->getSCEVAtScope(Address, L);
   const SCEVUnknown *BasePointer =
       dyn_cast<SCEVUnknown>(SE->getPointerBase(AccessFunction));
-  enum MemoryAccess::AccessType Type =
+  enum MemoryAccess::AccessType AccType =
       isa<LoadInst>(Inst) ? MemoryAccess::READ : MemoryAccess::MUST_WRITE;
 
   if (auto *BitCast = dyn_cast<BitCastInst>(Address)) {
     auto *Src = BitCast->getOperand(0);
     auto *SrcTy = Src->getType();
     auto *DstTy = BitCast->getType();
-    if (SrcTy->getPrimitiveSizeInBits() == DstTy->getPrimitiveSizeInBits())
+    // Do not try to delinearize non-sized (opaque) pointers.
+    if ((SrcTy->isPointerTy() && !SrcTy->getPointerElementType()->isSized()) ||
+        (DstTy->isPointerTy() && !DstTy->getPointerElementType()->isSized())) {
+      return false;
+    }
+    if (SrcTy->isPointerTy() && DstTy->isPointerTy() &&
+        DL->getTypeAllocSize(SrcTy->getPointerElementType()) ==
+            DL->getTypeAllocSize(DstTy->getPointerElementType()))
       Address = Src;
   }
 
@@ -4012,7 +4042,7 @@ bool ScopInfo::buildAccessMultiDimFixed(
     SizesSCEV.push_back(SE->getSCEV(
         ConstantInt::get(IntegerType::getInt64Ty(BasePtr->getContext()), V)));
 
-  addArrayAccess(Inst, Type, BasePointer->getValue(), ElementType, true,
+  addArrayAccess(Inst, AccType, BasePointer->getValue(), ElementType, true,
                  Subscripts, SizesSCEV, Val);
   return true;
 }
@@ -4028,7 +4058,7 @@ bool ScopInfo::buildAccessMultiDimParam(
   Value *Val = Inst.getValueOperand();
   Type *ElementType = Val->getType();
   unsigned ElementSize = DL->getTypeAllocSize(ElementType);
-  enum MemoryAccess::AccessType Type =
+  enum MemoryAccess::AccessType AccType =
       isa<LoadInst>(Inst) ? MemoryAccess::READ : MemoryAccess::MUST_WRITE;
 
   const SCEV *AccessFunction = SE->getSCEVAtScope(Address, L);
@@ -4057,7 +4087,7 @@ bool ScopInfo::buildAccessMultiDimParam(
   if (ElementSize != DelinearizedSize)
     scop->invalidate(DELINEARIZATION, Inst->getDebugLoc());
 
-  addArrayAccess(Inst, Type, BasePointer->getValue(), ElementType, true,
+  addArrayAccess(Inst, AccType, BasePointer->getValue(), ElementType, true,
                  AccItr->second.DelinearizedSubscripts, Sizes, Val);
   return true;
 }
@@ -4180,7 +4210,7 @@ void ScopInfo::buildAccessSingleDim(
   Value *Address = Inst.getPointerOperand();
   Value *Val = Inst.getValueOperand();
   Type *ElementType = Val->getType();
-  enum MemoryAccess::AccessType Type =
+  enum MemoryAccess::AccessType AccType =
       isa<LoadInst>(Inst) ? MemoryAccess::READ : MemoryAccess::MUST_WRITE;
 
   const SCEV *AccessFunction = SE->getSCEVAtScope(Address, L);
@@ -4209,10 +4239,10 @@ void ScopInfo::buildAccessSingleDim(
     if (!ScopRIL.count(LInst))
       IsAffine = false;
 
-  if (!IsAffine && Type == MemoryAccess::MUST_WRITE)
-    Type = MemoryAccess::MAY_WRITE;
+  if (!IsAffine && AccType == MemoryAccess::MUST_WRITE)
+    AccType = MemoryAccess::MAY_WRITE;
 
-  addArrayAccess(Inst, Type, BasePointer->getValue(), ElementType, IsAffine,
+  addArrayAccess(Inst, AccType, BasePointer->getValue(), ElementType, IsAffine,
                  {AccessFunction}, {}, Val);
 }
 
