@@ -72,6 +72,7 @@ using namespace polly;
 
 #define DEBUG_TYPE "polly-detect"
 
+
 // This option is set to a very high value, as analyzing such loops increases
 // compile time on several cases. For experiments that enable this option,
 // a value of around 40 has been working to avoid run-time regressions with
@@ -81,6 +82,12 @@ static cl::opt<int> ProfitabilityMinPerLoopInstructions(
     cl::desc("The minimal number of per-loop instructions before a single loop "
              "region is considered profitable"),
     cl::Hidden, cl::ValueRequired, cl::init(30), cl::cat(PollyCategory));
+
+static cl::opt<bool> PerLoopInstructionProfitability(
+    "polly-use-per-loop-inst-profitablility",
+    cl::desc("Use polly-detect-profitability-min-per-loop-insts "
+             "without changing the value"),
+    cl::Hidden, cl::init(false), cl::ZeroOrMore, cl::cat(PollyCategory));
 
 bool polly::PollyProcessUnprofitable;
 static cl::opt<bool, true> XPollyProcessUnprofitable(
@@ -1278,7 +1285,13 @@ bool ScopDetection::hasSufficientCompute(DetectionContext &Context,
 
   InstCount = InstCount / NumLoops;
 
-  return InstCount >= ProfitabilityMinPerLoopInstructions;
+  // Only use ProfitabilityMinPerLoopInstructions if 
+  // PerLoopInstructionProfitability is true.
+  if (PerLoopInstructionProfitability)
+    return InstCount >= ProfitabilityMinPerLoopInstructions;
+  else
+    return InstCount >= 100000000;
+
 }
 
 bool ScopDetection::isProfitableRegion(DetectionContext &Context) const {
