@@ -67,6 +67,11 @@ STATISTIC(RichScopFound, "Number of Scops containing a loop");
 // are also unlikely to result in good code
 static int const MaxConjunctsInDomain = 20;
 
+static cl::opt<bool> PollyRemarksMinimal(
+    "polly-remarks-minimal",
+    cl::desc("Do not emit remarks about assumptions that are known"),
+    cl::Hidden, cl::ZeroOrMore, cl::init(false), cl::cat(PollyCategory));
+
 static cl::opt<bool> ModelReadOnlyScalars(
     "polly-analyze-read-only-scalars",
     cl::desc("Model read-only scalar values in the scop description"),
@@ -98,12 +103,6 @@ static cl::opt<bool> DetectReductions("polly-detect-reductions",
                                       cl::desc("Detect and exploit reductions"),
                                       cl::Hidden, cl::ZeroOrMore,
                                       cl::init(true), cl::cat(PollyCategory));
-
-static cl::opt<bool> IgnoreIntegerWrapping(
-    "polly-ignore-integer-wrapping",
-    cl::desc("Do not build run-time checks to proof absence of integer "
-             "wrapping"),
-    cl::Hidden, cl::ZeroOrMore, cl::init(false), cl::cat(PollyCategory));
 
 //===----------------------------------------------------------------------===//
 
@@ -289,6 +288,58 @@ const ScopArrayInfo *ScopArrayInfo::getFromId(isl_id *Id) {
   return SAI;
 }
 
+void MemoryAccess::wrapConstantDimensions() {
+  auto *SAI = getScopArrayInfo();
+  auto *ArraySpace = SAI->getSpace();
+  auto *Ctx = isl_space_get_ctx(ArraySpace);
+  unsigned DimsArray = SAI->getNumberOfDimensions();
+
+  auto *DivModAff = isl_multi_aff_identity(isl_space_map_from_domain_and_range(
+      isl_space_copy(ArraySpace), isl_space_copy(ArraySpace)));
+  auto *LArraySpace = isl_local_space_from_space(ArraySpace);
+
+  // Begin with last dimension, to iteratively carry into higher dimensions.
+  for (int i = DimsArray - 1; i > 0; i--) {
+    auto *DimSize = SAI->getDimensionSize(i);
+    auto *DimSizeCst = dyn_cast<SCEVConstant>(DimSize);
+
+    // This transformation is not applicable to dimensions with dynamic size.
+    if (!DimSizeCst)
+      continue;
+
+    auto *DimSizeVal = isl_valFromAPInt(Ctx, DimSizeCst->getAPInt(), false);
+    auto *Var = isl_aff_var_on_domain(isl_local_space_copy(LArraySpace),
+                                      isl_dim_set, i);
+    auto *PrevVar = isl_aff_var_on_domain(isl_local_space_copy(LArraySpace),
+                                          isl_dim_set, i - 1);
+
+    // Compute: index % size
+    // Modulo must apply in the divide of the previous iteration, if any.
+    auto *Modulo = isl_aff_copy(Var);
+    Modulo = isl_aff_mod_val(Modulo, isl_val_copy(DimSizeVal));
+    Modulo = isl_aff_pullback_multi_aff(Modulo, isl_multi_aff_copy(DivModAff));
+
+    // Compute: floor(index / size)
+    auto *Divide = Var;
+    Divide = isl_aff_div(
+        Divide,
+        isl_aff_val_on_domain(isl_local_space_copy(LArraySpace), DimSizeVal));
+    Divide = isl_aff_floor(Divide);
+    Divide = isl_aff_add(Divide, PrevVar);
+    Divide = isl_aff_pullback_multi_aff(Divide, isl_multi_aff_copy(DivModAff));
+
+    // Apply Modulo and Divide.
+    DivModAff = isl_multi_aff_set_aff(DivModAff, i, Modulo);
+    DivModAff = isl_multi_aff_set_aff(DivModAff, i - 1, Divide);
+  }
+
+  // Apply all modulo/divides on the accesses.
+  AccessRelation =
+      isl_map_apply_range(AccessRelation, isl_map_from_multi_aff(DivModAff));
+  AccessRelation = isl_map_detect_equalities(AccessRelation);
+  isl_local_space_free(LArraySpace);
+}
+
 void MemoryAccess::updateDimensionality() {
   auto *SAI = getScopArrayInfo();
   auto *ArraySpace = SAI->getSpace();
@@ -330,6 +381,14 @@ void MemoryAccess::updateDimensionality() {
     isl_val *V = isl_val_int_from_si(Ctx, ArrayElemSize);
     AccessRelation = isl_map_floordiv_val(AccessRelation, V);
   }
+
+  // We currently do this only if we added at least one dimension, which means
+  // some dimension's indices have not been specified, an indicator that some
+  // index values have been added together.
+  // TODO: Investigate general usefulness; Effect on unit tests is to make index
+  // expressions more complicated.
+  if (DimsMissing)
+    wrapConstantDimensions();
 
   if (!isAffine())
     computeBoundsOnAccessRelation(ArrayElemSize);
@@ -605,9 +664,11 @@ void MemoryAccess::assumeNoOutOfBound() {
   // bail out more often than strictly necessary.
   Outside = isl_set_remove_divs(Outside);
   Outside = isl_set_complement(Outside);
-  auto &Loc = getAccessInstruction() ? getAccessInstruction()->getDebugLoc()
-                                     : DebugLoc();
-  Statement->getParent()->addAssumption(INBOUNDS, Outside, Loc, AS_ASSUMPTION);
+  const auto &Loc = getAccessInstruction()
+                        ? getAccessInstruction()->getDebugLoc()
+                        : DebugLoc();
+  Statement->getParent()->recordAssumption(INBOUNDS, Outside, Loc,
+                                           AS_ASSUMPTION);
   isl_space_free(Space);
 }
 
@@ -615,14 +676,14 @@ void MemoryAccess::buildMemIntrinsicAccessRelation() {
   assert(isa<MemIntrinsic>(getAccessInstruction()));
   assert(Subscripts.size() == 2 && Sizes.size() == 0);
 
-  auto *SubscriptPWA = Statement->getPwAff(Subscripts[0]);
+  auto *SubscriptPWA = getPwAff(Subscripts[0]);
   auto *SubscriptMap = isl_map_from_pw_aff(SubscriptPWA);
 
   isl_map *LengthMap;
   if (Subscripts[1] == nullptr) {
     LengthMap = isl_map_universe(isl_map_get_space(SubscriptMap));
   } else {
-    auto *LengthPWA = Statement->getPwAff(Subscripts[1]);
+    auto *LengthPWA = getPwAff(Subscripts[1]);
     LengthMap = isl_map_from_pw_aff(LengthPWA);
     auto *RangeSpace = isl_space_range(isl_map_get_space(LengthMap));
     LengthMap = isl_map_apply_range(LengthMap, isl_map_lex_gt(RangeSpace));
@@ -681,7 +742,7 @@ __isl_give isl_map *MemoryAccess::foldAccess(__isl_take isl_map *AccessRelation,
   for (int i = Size - 2; i >= 0; --i) {
     isl_space *Space;
     isl_map *MapOne, *MapTwo;
-    isl_pw_aff *DimSize = Statement->getPwAff(Sizes[i]);
+    isl_pw_aff *DimSize = getPwAff(Sizes[i]);
 
     isl_space *SpaceSize = isl_pw_aff_get_space(DimSize);
     isl_pw_aff_free(DimSize);
@@ -779,7 +840,7 @@ void MemoryAccess::buildAccessRelation(const ScopArrayInfo *SAI) {
   AccessRelation = isl_map_universe(Space);
 
   for (int i = 0, Size = Subscripts.size(); i < Size; ++i) {
-    isl_pw_aff *Affine = Statement->getPwAff(Subscripts[i]);
+    isl_pw_aff *Affine = getPwAff(Subscripts[i]);
     isl_map *SubscriptMap = isl_map_from_pw_aff(Affine);
     AccessRelation = isl_map_flat_range_product(AccessRelation, SubscriptMap);
   }
@@ -857,6 +918,11 @@ void MemoryAccess::print(raw_ostream &OS) const {
 }
 
 void MemoryAccess::dump() const { print(errs()); }
+
+__isl_give isl_pw_aff *MemoryAccess::getPwAff(const SCEV *E) {
+  auto *Stmt = getStatement();
+  return Stmt->getParent()->getPwAff(E, Stmt->getEntryBlock());
+}
 
 // Create a map in the size of the provided set domain, that maps from the
 // one element of the provided set domain to another element of the provided
@@ -1030,6 +1096,7 @@ void ScopStmt::realignParams() {
   for (MemoryAccess *MA : *this)
     MA->realignParams();
 
+  InvalidContext = isl_set_align_params(InvalidContext, Parent.getParamSpace());
   Domain = isl_set_align_params(Domain, Parent.getParamSpace());
 }
 
@@ -1153,16 +1220,17 @@ static __isl_give isl_set *buildConditionSet(ICmpInst::Predicate Pred,
 /// will be moved from @p SI to its successors. Hence, @p ConditionSets will
 /// have as many elements as @p SI has successors.
 static void
-buildConditionSets(Scop &S, SwitchInst *SI, Loop *L, __isl_keep isl_set *Domain,
+buildConditionSets(ScopStmt &Stmt, SwitchInst *SI, Loop *L,
+                   __isl_keep isl_set *Domain,
                    SmallVectorImpl<__isl_give isl_set *> &ConditionSets) {
 
   Value *Condition = getConditionFromTerminator(SI);
   assert(Condition && "No condition for switch");
 
+  Scop &S = *Stmt.getParent();
   ScalarEvolution &SE = *S.getSE();
-  BasicBlock *BB = SI->getParent();
   isl_pw_aff *LHS, *RHS;
-  LHS = S.getPwAff(SE.getSCEVAtScope(Condition, L), BB);
+  LHS = Stmt.getPwAff(SE.getSCEVAtScope(Condition, L));
 
   unsigned NumSuccessors = SI->getNumSuccessors();
   ConditionSets.resize(NumSuccessors);
@@ -1170,7 +1238,7 @@ buildConditionSets(Scop &S, SwitchInst *SI, Loop *L, __isl_keep isl_set *Domain,
     unsigned Idx = Case.getSuccessorIndex();
     ConstantInt *CaseValue = Case.getCaseValue();
 
-    RHS = S.getPwAff(SE.getSCEV(CaseValue), BB);
+    RHS = Stmt.getPwAff(SE.getSCEV(CaseValue));
     isl_set *CaseConditionSet =
         buildConditionSet(ICmpInst::ICMP_EQ, isl_pw_aff_copy(LHS), RHS, Domain);
     ConditionSets[Idx] = isl_set_coalesce(
@@ -1185,7 +1253,6 @@ buildConditionSets(Scop &S, SwitchInst *SI, Loop *L, __isl_keep isl_set *Domain,
   ConditionSets[0] = setDimensionIds(
       Domain, isl_set_subtract(isl_set_copy(Domain), ConditionSetUnion));
 
-  S.markAsOptimized();
   isl_pw_aff_free(LHS);
 }
 
@@ -1198,10 +1265,11 @@ buildConditionSets(Scop &S, SwitchInst *SI, Loop *L, __isl_keep isl_set *Domain,
 /// context under which @p Condition is true/false will be returned as the
 /// new elements of @p ConditionSets.
 static void
-buildConditionSets(Scop &S, Value *Condition, TerminatorInst *TI, Loop *L,
-                   __isl_keep isl_set *Domain,
+buildConditionSets(ScopStmt &Stmt, Value *Condition, TerminatorInst *TI,
+                   Loop *L, __isl_keep isl_set *Domain,
                    SmallVectorImpl<__isl_give isl_set *> &ConditionSets) {
 
+  Scop &S = *Stmt.getParent();
   isl_set *ConsequenceCondSet = nullptr;
   if (auto *CCond = dyn_cast<ConstantInt>(Condition)) {
     if (CCond->isZero())
@@ -1212,8 +1280,10 @@ buildConditionSets(Scop &S, Value *Condition, TerminatorInst *TI, Loop *L,
     auto Opcode = BinOp->getOpcode();
     assert(Opcode == Instruction::And || Opcode == Instruction::Or);
 
-    buildConditionSets(S, BinOp->getOperand(0), TI, L, Domain, ConditionSets);
-    buildConditionSets(S, BinOp->getOperand(1), TI, L, Domain, ConditionSets);
+    buildConditionSets(Stmt, BinOp->getOperand(0), TI, L, Domain,
+                       ConditionSets);
+    buildConditionSets(Stmt, BinOp->getOperand(1), TI, L, Domain,
+                       ConditionSets);
 
     isl_set_free(ConditionSets.pop_back_val());
     isl_set *ConsCondPart0 = ConditionSets.pop_back_val();
@@ -1230,10 +1300,9 @@ buildConditionSets(Scop &S, Value *Condition, TerminatorInst *TI, Loop *L,
            "Condition of exiting branch was neither constant nor ICmp!");
 
     ScalarEvolution &SE = *S.getSE();
-    BasicBlock *BB = TI ? TI->getParent() : nullptr;
     isl_pw_aff *LHS, *RHS;
-    LHS = S.getPwAff(SE.getSCEVAtScope(ICond->getOperand(0), L), BB);
-    RHS = S.getPwAff(SE.getSCEVAtScope(ICond->getOperand(1), L), BB);
+    LHS = Stmt.getPwAff(SE.getSCEVAtScope(ICond->getOperand(0), L));
+    RHS = Stmt.getPwAff(SE.getSCEVAtScope(ICond->getOperand(1), L));
     ConsequenceCondSet =
         buildConditionSet(ICond->getPredicate(), LHS, RHS, Domain);
   }
@@ -1267,12 +1336,12 @@ buildConditionSets(Scop &S, Value *Condition, TerminatorInst *TI, Loop *L,
 /// will be moved from @p TI to its successors. Hence, @p ConditionSets will
 /// have as many elements as @p TI has successors.
 static void
-buildConditionSets(Scop &S, TerminatorInst *TI, Loop *L,
+buildConditionSets(ScopStmt &Stmt, TerminatorInst *TI, Loop *L,
                    __isl_keep isl_set *Domain,
                    SmallVectorImpl<__isl_give isl_set *> &ConditionSets) {
 
   if (SwitchInst *SI = dyn_cast<SwitchInst>(TI))
-    return buildConditionSets(S, SI, L, Domain, ConditionSets);
+    return buildConditionSets(Stmt, SI, L, Domain, ConditionSets);
 
   assert(isa<BranchInst>(TI) && "Terminator was neither branch nor switch.");
 
@@ -1284,7 +1353,7 @@ buildConditionSets(Scop &S, TerminatorInst *TI, Loop *L,
   Value *Condition = getConditionFromTerminator(TI);
   assert(Condition && "No condition for Terminator");
 
-  return buildConditionSets(S, Condition, TI, L, Domain, ConditionSets);
+  return buildConditionSets(Stmt, Condition, TI, L, Domain, ConditionSets);
 }
 
 void ScopStmt::buildDomain() {
@@ -1353,8 +1422,8 @@ void ScopStmt::deriveAssumptionsFromGEP(GetElementPtrInst *GEP,
         isl_set_union(isl_set_copy(NotExecuted), InBound);
 
     InBoundIfExecuted = isl_set_coalesce(InBoundIfExecuted);
-    Parent.addAssumption(INBOUNDS, InBoundIfExecuted, GEP->getDebugLoc(),
-                         AS_ASSUMPTION);
+    Parent.recordAssumption(INBOUNDS, InBoundIfExecuted, GEP->getDebugLoc(),
+                            AS_ASSUMPTION);
   }
 
   isl_local_space_free(LSpace);
@@ -1376,13 +1445,15 @@ void ScopStmt::collectSurroundingLoops() {
 }
 
 ScopStmt::ScopStmt(Scop &parent, Region &R)
-    : Parent(parent), Domain(nullptr), BB(nullptr), R(&R), Build(nullptr) {
+    : Parent(parent), InvalidContext(isl_set_empty(Parent.getParamSpace())),
+      Domain(nullptr), BB(nullptr), R(&R), Build(nullptr) {
 
   BaseName = getIslCompatibleName("Stmt_", R.getNameStr(), "");
 }
 
 ScopStmt::ScopStmt(Scop &parent, BasicBlock &bb)
-    : Parent(parent), Domain(nullptr), BB(&bb), R(nullptr), Build(nullptr) {
+    : Parent(parent), InvalidContext(isl_set_empty(Parent.getParamSpace())),
+      Domain(nullptr), BB(&bb), R(nullptr), Build(nullptr) {
 
   BaseName = getIslCompatibleName("Stmt_", &bb, "");
 }
@@ -1544,6 +1615,11 @@ std::string ScopStmt::getScheduleStr() const {
   return Str;
 }
 
+void ScopStmt::setInvalidContext(__isl_take isl_set *IC) {
+  isl_set_free(InvalidContext);
+  InvalidContext = IC;
+}
+
 BasicBlock *ScopStmt::getEntryBlock() const {
   if (isBlockStmt())
     return getBasicBlock();
@@ -1578,7 +1654,10 @@ __isl_give isl_id *ScopStmt::getDomainId() const {
   return isl_set_get_tuple_id(Domain);
 }
 
-ScopStmt::~ScopStmt() { isl_set_free(Domain); }
+ScopStmt::~ScopStmt() {
+  isl_set_free(Domain);
+  isl_set_free(InvalidContext);
+}
 
 void ScopStmt::print(raw_ostream &OS) const {
   OS << "\t" << getBaseName() << "\n";
@@ -1770,14 +1849,6 @@ __isl_give isl_set *Scop::addNonEmptyDomainConstraints(isl_set *C) const {
   return isl_set_intersect_params(C, DomainContext);
 }
 
-void Scop::addWrappingContext() {
-  if (IgnoreIntegerWrapping)
-    return;
-
-  auto *WrappingContext = Affinator.getWrappingContext();
-  addAssumption(WRAPPING, WrappingContext, DebugLoc(), AS_RESTRICTION);
-}
-
 void Scop::addUserAssumptions(AssumptionCache &AC, DominatorTree &DT,
                               LoopInfo &LI) {
   auto *R = &getRegion();
@@ -1802,7 +1873,7 @@ void Scop::addUserAssumptions(AssumptionCache &AC, DominatorTree &DT,
     addParams(Params);
 
     SmallVector<isl_set *, 2> ConditionSets;
-    buildConditionSets(*this, Val, nullptr, L, Context, ConditionSets);
+    buildConditionSets(*Stmts.begin(), Val, nullptr, L, Context, ConditionSets);
     assert(ConditionSets.size() == 2);
     isl_set_free(ConditionSets[1]);
 
@@ -2111,11 +2182,11 @@ static inline __isl_give isl_set *addDomainDimId(__isl_take isl_set *Domain,
   return isl_set_set_dim_id(Domain, isl_dim_set, Dim, DimId);
 }
 
-__isl_give isl_set *Scop::getDomainConditions(ScopStmt *Stmt) {
+__isl_give isl_set *Scop::getDomainConditions(const ScopStmt *Stmt) const {
   return getDomainConditions(Stmt->getEntryBlock());
 }
 
-__isl_give isl_set *Scop::getDomainConditions(BasicBlock *BB) {
+__isl_give isl_set *Scop::getDomainConditions(BasicBlock *BB) const {
   auto DIt = DomainMap.find(BB);
   if (DIt != DomainMap.end())
     return isl_set_copy(DIt->getSecond());
@@ -2161,9 +2232,9 @@ bool Scop::buildDomains(Region *R, ScopDetection &SD, DominatorTree &DT,
   // can themselves not be constructed properly. To this end we will replace
   // the domains of error blocks and those only reachable via error blocks
   // with an empty set. Additionally, we will record for each block under which
-  // parameter combination it would be reached via an error block in the
-  // ErrorDomainCtxMap map. This information is needed during load hoisting.
-  propagateErrorConstraints(R, SD, DT, LI);
+  // parameter combination it would be reached via an error block in its
+  // InvalidContext. This information is needed during load hoisting.
+  propagateInvalidStmtContexts(R, SD, DT, LI);
 
   return true;
 }
@@ -2227,8 +2298,8 @@ static __isl_give isl_set *adjustDomainDimensions(Scop &S,
   return Dom;
 }
 
-void Scop::propagateErrorConstraints(Region *R, ScopDetection &SD,
-                                     DominatorTree &DT, LoopInfo &LI) {
+void Scop::propagateInvalidStmtContexts(Region *R, ScopDetection &SD,
+                                        DominatorTree &DT, LoopInfo &LI) {
 
   ReversePostOrderTraversal<Region *> RTraversal(R);
   for (auto *RN : RTraversal) {
@@ -2238,23 +2309,24 @@ void Scop::propagateErrorConstraints(Region *R, ScopDetection &SD,
     if (RN->isSubRegion()) {
       Region *SubRegion = RN->getNodeAs<Region>();
       if (!SD.isNonAffineSubRegion(SubRegion, &getRegion())) {
-        propagateErrorConstraints(SubRegion, SD, DT, LI);
+        propagateInvalidStmtContexts(SubRegion, SD, DT, LI);
         continue;
       }
     }
 
     bool ContainsErrorBlock = containsErrorBlock(RN, getRegion(), LI, DT);
     BasicBlock *BB = getRegionNodeBasicBlock(RN);
+    ScopStmt *Stmt = getStmtFor(BB);
     isl_set *&Domain = DomainMap[BB];
     assert(Domain && "Cannot propagate a nullptr");
 
-    auto *&ErrorCtx = ErrorDomainCtxMap[BB];
+    auto *InvalidCtx = Stmt->getInvalidContext();
     auto *DomainCtx = isl_set_params(isl_set_copy(Domain));
-    bool IsErrorBlock = ContainsErrorBlock ||
-                        (ErrorCtx && isl_set_is_subset(DomainCtx, ErrorCtx));
+    bool IsInvalidBlock =
+        ContainsErrorBlock || isl_set_is_subset(DomainCtx, InvalidCtx);
 
-    if (IsErrorBlock) {
-      ErrorCtx = ErrorCtx ? isl_set_union(ErrorCtx, DomainCtx) : DomainCtx;
+    if (IsInvalidBlock) {
+      InvalidCtx = isl_set_coalesce(isl_set_union(InvalidCtx, DomainCtx));
       auto *EmptyDom = isl_set_empty(isl_set_get_space(Domain));
       isl_set_free(Domain);
       Domain = EmptyDom;
@@ -2262,22 +2334,32 @@ void Scop::propagateErrorConstraints(Region *R, ScopDetection &SD,
       isl_set_free(DomainCtx);
     }
 
-    if (!ErrorCtx)
+    if (isl_set_is_empty(InvalidCtx)) {
+      isl_set_free(InvalidCtx);
       continue;
+    }
+
+    Stmt->setInvalidContext(InvalidCtx);
 
     auto *TI = BB->getTerminator();
     unsigned NumSuccs = RN->isSubRegion() ? 1 : TI->getNumSuccessors();
     for (unsigned u = 0; u < NumSuccs; u++) {
       auto *SuccBB = getRegionNodeSuccessor(RN, TI, u);
-      auto *&SuccErrorCtx = ErrorDomainCtxMap[SuccBB];
-      auto *CurErrorCtx = isl_set_copy(ErrorCtx);
-      SuccErrorCtx =
-          SuccErrorCtx ? isl_set_union(SuccErrorCtx, CurErrorCtx) : CurErrorCtx;
-      SuccErrorCtx = isl_set_coalesce(SuccErrorCtx);
+      auto *SuccStmt = getStmtFor(SuccBB);
+
+      // Skip successors outside the SCoP.
+      if (!SuccStmt)
+        continue;
+
+      auto *SuccInvalidCtx = SuccStmt->getInvalidContext();
+      SuccInvalidCtx = isl_set_union(SuccInvalidCtx, Stmt->getInvalidContext());
+      SuccInvalidCtx = isl_set_coalesce(SuccInvalidCtx);
+      unsigned NumConjucts = isl_set_n_basic_set(SuccInvalidCtx);
+      SuccStmt->setInvalidContext(SuccInvalidCtx);
 
       // Check if the maximal number of domain conjuncts was reached.
       // In case this happens we will bail.
-      if (isl_set_n_basic_set(SuccErrorCtx) < MaxConjunctsInDomain)
+      if (NumConjucts < MaxConjunctsInDomain)
         continue;
 
       invalidate(COMPLEXITY, TI->getDebugLoc());
@@ -2399,7 +2481,7 @@ bool Scop::buildDomainsWithBranchConstraints(Region *R, ScopDetection &SD,
     if (RN->isSubRegion())
       ConditionSets.push_back(isl_set_copy(Domain));
     else
-      buildConditionSets(*this, TI, BBLoop, Domain, ConditionSets);
+      buildConditionSets(*getStmtFor(BB), TI, BBLoop, Domain, ConditionSets);
 
     // Now iterate over the successors and set their initial domain based on
     // their condition set. We skip back edges here and have to be careful when
@@ -2409,6 +2491,13 @@ bool Scop::buildDomainsWithBranchConstraints(Region *R, ScopDetection &SD,
     for (unsigned u = 0, e = ConditionSets.size(); u < e; u++) {
       isl_set *CondSet = ConditionSets[u];
       BasicBlock *SuccBB = getRegionNodeSuccessor(RN, TI, u);
+
+      auto *SuccStmt = getStmtFor(SuccBB);
+      // Skip blocks outside the region.
+      if (!SuccStmt) {
+        isl_set_free(CondSet);
+        continue;
+      }
 
       // If we propagate the domain of some block to "SuccBB" we do not have to
       // adjust the domain.
@@ -2552,8 +2641,8 @@ void Scop::propagateDomainConstraints(Region *R, ScopDetection &SD,
     if (containsErrorBlock(RN, getRegion(), LI, DT)) {
       IsOptimized = true;
       isl_set *DomPar = isl_set_params(isl_set_copy(Domain));
-      addAssumption(ERRORBLOCK, DomPar, BB->getTerminator()->getDebugLoc(),
-                    AS_RESTRICTION);
+      recordAssumption(ERRORBLOCK, DomPar, BB->getTerminator()->getDebugLoc(),
+                       AS_RESTRICTION);
     }
   }
 }
@@ -2611,7 +2700,8 @@ void Scop::addLoopBoundsToHeaderDomain(Loop *L, LoopInfo &LI) {
     else {
       SmallVector<isl_set *, 8> ConditionSets;
       int idx = BI->getSuccessor(0) != HeaderBB;
-      buildConditionSets(*this, TI, L, LatchBBDom, ConditionSets);
+      buildConditionSets(*getStmtFor(LatchBB), TI, L, LatchBBDom,
+                         ConditionSets);
 
       // Free the non back edge condition set as we do not need it.
       isl_set_free(ConditionSets[1 - idx]);
@@ -2653,8 +2743,8 @@ void Scop::addLoopBoundsToHeaderDomain(Loop *L, LoopInfo &LI) {
   }
 
   isl_set *UnboundedCtx = isl_set_params(Parts.first);
-  addAssumption(INFINITELOOP, UnboundedCtx,
-                HeaderBB->getTerminator()->getDebugLoc(), AS_RESTRICTION);
+  recordAssumption(INFINITELOOP, UnboundedCtx,
+                   HeaderBB->getTerminator()->getDebugLoc(), AS_RESTRICTION);
 }
 
 void Scop::buildAliasChecks(AliasAnalysis &AA) {
@@ -2913,11 +3003,12 @@ Scop::Scop(Region &R, ScalarEvolution &ScalarEvolution, LoopInfo &LI,
 
 void Scop::init(AliasAnalysis &AA, AssumptionCache &AC, ScopDetection &SD,
                 DominatorTree &DT, LoopInfo &LI) {
-  addUserAssumptions(AC, DT, LI);
   buildInvariantEquivalenceClasses(SD);
 
   if (!buildDomains(&R, SD, DT, LI))
     return;
+
+  addUserAssumptions(AC, DT, LI);
 
   // Remove empty and ignored statements.
   // Exit early in case there are no executable statements left in this scop.
@@ -2938,7 +3029,12 @@ void Scop::init(AliasAnalysis &AA, AssumptionCache &AC, ScopDetection &SD,
   realignParams();
   addParameterBounds();
   addUserContext();
-  addWrappingContext();
+
+  // After the context was fully constructed, thus all our knowledge about
+  // the parameters is in there, we add all recorded assumptions to the
+  // assumed/invalid context.
+  addRecordedAssumptions();
+
   simplifyContexts();
   buildAliasChecks(AA);
 
@@ -2955,8 +3051,9 @@ Scop::~Scop() {
 
   for (auto It : DomainMap)
     isl_set_free(It.second);
-  for (auto It : ErrorDomainCtxMap)
-    isl_set_free(It.second);
+
+  for (auto &AS : RecordedAssumptions)
+    isl_set_free(AS.Set);
 
   // Free the alias groups
   for (MinMaxVectorPairTy &MinMaxAccessPair : MinMaxAliasGroups) {
@@ -3069,18 +3166,12 @@ const InvariantEquivClassTy *Scop::lookupInvariantEquivClass(Value *Val) const {
   return nullptr;
 }
 
-__isl_give isl_set *Scop::getErrorCtxReachingStmt(ScopStmt &Stmt) {
-  auto *BB = Stmt.getEntryBlock();
-  return isl_set_copy(ErrorDomainCtxMap.lookup(BB));
-}
-
 void Scop::addInvariantLoads(ScopStmt &Stmt, MemoryAccessList &InvMAs) {
 
   // Get the context under which the statement is executed but remove the error
   // context under which this statement is reached.
   isl_set *DomainCtx = isl_set_params(Stmt.getDomain());
-  if (auto *ErrorCtx = getErrorCtxReachingStmt(Stmt))
-    DomainCtx = isl_set_subtract(DomainCtx, ErrorCtx);
+  DomainCtx = isl_set_subtract(DomainCtx, Stmt.getInvalidContext());
   DomainCtx = isl_set_remove_redundancies(DomainCtx);
   DomainCtx = isl_set_detect_equalities(DomainCtx);
   DomainCtx = isl_set_coalesce(DomainCtx);
@@ -3346,6 +3437,7 @@ bool Scop::hasFeasibleRuntimeContext() const {
   auto *NegativeContext = getInvalidContext();
   auto *DomainContext = isl_union_set_params(getDomains());
   IsFeasible = !isl_set_is_subset(DomainContext, NegativeContext);
+  IsFeasible &= !isl_set_is_subset(Context, NegativeContext);
   isl_set_free(NegativeContext);
   isl_set_free(DomainContext);
 
@@ -3376,18 +3468,20 @@ static std::string toString(AssumptionKind Kind) {
 
 bool Scop::trackAssumption(AssumptionKind Kind, __isl_keep isl_set *Set,
                            DebugLoc Loc, AssumptionSign Sign) {
-  if (Sign == AS_ASSUMPTION) {
-    if (isl_set_is_subset(Context, Set))
-      return false;
+  if (PollyRemarksMinimal) {
+    if (Sign == AS_ASSUMPTION) {
+      if (isl_set_is_subset(Context, Set))
+        return false;
 
-    if (isl_set_is_subset(AssumedContext, Set))
-      return false;
-  } else {
-    if (isl_set_is_disjoint(Set, Context))
-      return false;
+      if (isl_set_is_subset(AssumedContext, Set))
+        return false;
+    } else {
+      if (isl_set_is_disjoint(Set, Context))
+        return false;
 
-    if (isl_set_is_subset(Set, InvalidContext))
-      return false;
+      if (isl_set_is_subset(Set, InvalidContext))
+        return false;
+    }
   }
 
   auto &F = *getRegion().getEntry()->getParent();
@@ -3399,6 +3493,9 @@ bool Scop::trackAssumption(AssumptionKind Kind, __isl_keep isl_set *Set,
 
 void Scop::addAssumption(AssumptionKind Kind, __isl_take isl_set *Set,
                          DebugLoc Loc, AssumptionSign Sign) {
+  // Simplify the assumptions/restrictions first.
+  Set = isl_set_gist_params(Set, getContext());
+
   if (!trackAssumption(Kind, Set, Loc, Sign)) {
     isl_set_free(Set);
     return;
@@ -3410,6 +3507,24 @@ void Scop::addAssumption(AssumptionKind Kind, __isl_take isl_set *Set,
   } else {
     InvalidContext = isl_set_union(InvalidContext, Set);
     InvalidContext = isl_set_coalesce(InvalidContext);
+  }
+}
+
+void Scop::recordAssumption(AssumptionKind Kind, __isl_take isl_set *Set,
+                            DebugLoc Loc, AssumptionSign Sign, BasicBlock *BB) {
+  RecordedAssumptions.push_back({Kind, Sign, Set, Loc, BB});
+}
+
+void Scop::addRecordedAssumptions() {
+  while (!RecordedAssumptions.empty()) {
+    const Assumption &AS = RecordedAssumptions.pop_back_val();
+
+    isl_set *S = AS.Set;
+    // If a basic block was given use its domain to simplify the assumption.
+    if (AS.BB)
+      S = isl_set_params(isl_set_intersect(S, getDomainConditions(AS.BB)));
+
+    addAssumption(AS.Kind, S, AS.Loc, AS.Sign);
   }
 }
 
