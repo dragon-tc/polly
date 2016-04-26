@@ -53,6 +53,7 @@
 #include "polly/Options.h"
 #include "polly/ScopInfo.h"
 #include "polly/Support/GICHelper.h"
+#include "polly/DragonTC.h"
 #include "llvm/Support/Debug.h"
 #include "isl/aff.h"
 #include "isl/band.h"
@@ -159,6 +160,13 @@ static cl::list<int>
                                "with --polly-register-tile-size"),
                       cl::Hidden, cl::ZeroOrMore, cl::CommaSeparated,
                       cl::cat(PollyCategory));
+
+// Enable optimizations used by DragonTC.
+if (DragonTCOptimizations) {
+  std::string FusionStrategy = "max";
+  std::string MaximizeBandDepth = "yes";
+  bool polly::RegisterTiling = true;
+}
 
 /// @brief Create an isl_union_set, which describes the isolate option based
 ///        on IsoalteDomain.

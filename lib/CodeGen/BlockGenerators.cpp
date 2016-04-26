@@ -22,6 +22,7 @@
 #include "polly/Support/GICHelper.h"
 #include "polly/Support/SCEVValidator.h"
 #include "polly/Support/ScopHelper.h"
+#include "polly/DragonTC.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/RegionInfo.h"
 #include "llvm/Analysis/ScalarEvolution.h"
@@ -47,6 +48,10 @@ static cl::opt<bool> DebugPrinting(
     "polly-codegen-add-debug-printing",
     cl::desc("Add printf calls that show the values loaded/stored."),
     cl::Hidden, cl::init(false), cl::ZeroOrMore, cl::cat(PollyCategory));
+
+// Enable optimizations used by DragonTC.
+if (DragonTCOptimizations)
+  bool polly:Aligned = true;
 
 BlockGenerator::BlockGenerator(PollyIRBuilder &B, LoopInfo &LI,
                                ScalarEvolution &SE, DominatorTree &DT,

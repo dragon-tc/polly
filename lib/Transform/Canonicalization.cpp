@@ -16,6 +16,7 @@
 #include "polly/Canonicalization.h"
 #include "polly/LinkAllPasses.h"
 #include "polly/Options.h"
+#include "polly/DragonTC.h"
 #include "llvm/Transforms/IPO.h"
 #include "llvm/Transforms/Scalar.h"
 
@@ -26,6 +27,10 @@ static cl::opt<bool>
     PollyInliner("polly-run-inliner",
                  cl::desc("Run an early inliner pass before Polly"), cl::Hidden,
                  cl::init(false), cl::ZeroOrMore, cl::cat(PollyCategory));
+
+// Enable optimizations used by DragonTC.
+if (DragonTCOptimizations)
+  bool polly::PollyInliner = true;
 
 void polly::registerCanonicalicationPasses(llvm::legacy::PassManagerBase &PM) {
   PM.add(llvm::createPromoteMemoryToRegisterPass());

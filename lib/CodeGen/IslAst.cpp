@@ -34,6 +34,7 @@
 #include "polly/Options.h"
 #include "polly/ScopInfo.h"
 #include "polly/Support/GICHelper.h"
+#include "polly/DragonTC.h"
 #include "llvm/Analysis/RegionInfo.h"
 #include "llvm/Support/Debug.h"
 #include "isl/aff.h"
@@ -70,6 +71,13 @@ static cl::opt<bool> DetectParallel("polly-ast-detect-parallel",
                                     cl::desc("Detect parallelism"), cl::Hidden,
                                     cl::init(false), cl::ZeroOrMore,
                                     cl::cat(PollyCategory));
+
+// Enable optimizations used by DragonTC.
+if (DragonTCOptimizations) {
+  bool polly::PollyParallel = true;
+  bool polly::PollyParallelForce = true;
+  bool polly::UseContext = true;
+}
 
 namespace polly {
 /// @brief Temporary information used when building the ast.

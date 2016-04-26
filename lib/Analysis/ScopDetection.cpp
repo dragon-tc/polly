@@ -51,6 +51,7 @@
 #include "polly/ScopDetectionDiagnostic.h"
 #include "polly/Support/SCEVValidator.h"
 #include "polly/Support/ScopLocation.h"
+#include "polly/DragonTC.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/LoopInfo.h"
@@ -189,6 +190,16 @@ static cl::opt<bool, true> XPollyInvariantLoadHoisting(
     "polly-invariant-load-hoisting", cl::desc("Hoist invariant loads."),
     cl::location(PollyInvariantLoadHoisting), cl::Hidden, cl::ZeroOrMore,
     cl::init(true), cl::cat(PollyCategory));
+
+// Enable optimizations used by DragonTC
+if (DragonTCOptimizations) {
+  bool polly::PerLoopInstructionProfitability = true;
+  bool polly::AllowNonAffine = true;
+  bool polly::AllowModrefCall = true;
+  bool polly::AllowNonAffineLoops = true;
+  bool polly::AllowUnsigned = true;
+  bool polly::KeepGoing = true;
+}
 
 /// @brief The minimal trip count under which loops are considered unprofitable.
 static const unsigned MIN_LOOP_TRIP_COUNT = 8;

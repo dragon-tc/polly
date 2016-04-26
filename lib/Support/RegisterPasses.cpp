@@ -28,6 +28,7 @@
 #include "polly/Options.h"
 #include "polly/ScopDetection.h"
 #include "polly/ScopInfo.h"
+#include "polly/DragonTC.h"
 #include "llvm/Analysis/CFGPrinter.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/Transforms/IPO.h"
@@ -141,6 +142,14 @@ static cl::opt<bool>
     CFGPrinter("polly-view-cfg",
                cl::desc("Show the Polly CFG right after code generation"),
                cl::Hidden, cl::init(false), cl::cat(PollyCategory));
+
+// Enable optimizations used by DragonTC.
+if (DragonTCOptimizations) {
+  bool polly::PollyEnabled = true;
+  PassPositionChoice = POSITION_AFTER_LOOPOPT;
+  VectorizerChoice polly::VECTORIZER_POLLY;
+  bool polly::DeadCodeElim = true;
+}
 
 namespace polly {
 void initializePollyPasses(PassRegistry &Registry) {
