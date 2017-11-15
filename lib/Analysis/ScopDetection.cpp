@@ -76,11 +76,11 @@ using namespace polly;
 // compile time on several cases. For experiments that enable this option,
 // a value of around 40 has been working to avoid run-time regressions with
 // Polly while still exposing interesting optimization opportunities.
-static cl::opt<int> ProfitabilityMinPerLoopInstructions(
+static cl::opt<bool, true> ProfitabilityMinPerLoopInstructions(
     "polly-detect-profitability-min-per-loop-insts",
     cl::desc("The minimal number of per-loop instructions before a single loop "
              "region is considered profitable"),
-    cl::Hidden, cl::ValueRequired, cl::init(100000000), cl::cat(PollyCategory));
+    cl::init(false), cl::ZeroOrMore, cl::cat(PollyCategory));
 
 bool polly::PollyProcessUnprofitable;
 static cl::opt<bool, true> XPollyProcessUnprofitable(
@@ -1350,7 +1350,10 @@ bool ScopDetection::hasSufficientCompute(DetectionContext &Context,
 
   InstCount = InstCount / NumLoops;
 
-  return InstCount >= ProfitabilityMinPerLoopInstructions;
+  if (ProfitabilityMinPerLoopInstructions)
+    return InstCount >= 30;
+  else
+    return InstCount >= 100000000;
 }
 
 bool ScopDetection::hasPossiblyDistributableLoop(
